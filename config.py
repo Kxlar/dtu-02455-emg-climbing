@@ -10,69 +10,56 @@ EVERYDAY_DIR = STIM_DIR / "everyday"
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = DATA_DIR / "logs"
 RAW_SHIMMER_DIR = DATA_DIR / "raw_shimmer"
-PROCESSED_DIR = DATA_DIR / "processed"
-
 EPOCHS_DIR = DATA_DIR / "epochs"
 PROCESSED_DIR = DATA_DIR / "processed"
 PLOTS_DIR = PROCESSED_DIR / "qc_plots"
-
 STATS_DIR = DATA_DIR / "stats_results"
 STATS_PLOTS_DIR = STATS_DIR / "figures"
 
-for d in [CLIMBING_DIR, EVERYDAY_DIR, LOG_DIR, RAW_SHIMMER_DIR, PROCESSED_DIR, EPOCHS_DIR, PLOTS_DIR, STATS_DIR, STATS_PLOTS_DIR]:
+for d in [
+    CLIMBING_DIR, EVERYDAY_DIR, LOG_DIR, RAW_SHIMMER_DIR,
+    EPOCHS_DIR, PROCESSED_DIR, PLOTS_DIR, STATS_DIR, STATS_PLOTS_DIR
+]:
     d.mkdir(parents=True, exist_ok=True)
 
 # --- EXPERIMENT TIMING PARAMETERS (in seconds) ---
+SYNC_COUNTDOWN_DURATION = 3.0  # Countdown before Start Squeeze
+SYNC_SQUEEZE_DURATION = 1.5    # Duration of Start & End calibration squeezes (1.5s)
+POST_SYNC_SETTLE = 8.0         # Post-squeeze relaxation window before baseline
 BASELINE_DURATION = 10.0       # 10s resting baseline
 ISI_MIN = 4.0                  # Minimum jittered Inter-Stimulus Interval
 ISI_MAX = 7.0                  # Maximum jittered Inter-Stimulus Interval
-N_CLIPS_PER_CONDITION = 20     # n climbing + n everyday = 2n trials total
-SYNC_COUNTDOWN_DURATION = 3.0  # Countdown before sync squeeze
-SYNC_SQUEEZE_DURATION = 1.0    # Duration of the sync squeeze (1s)
-POST_SYNC_SETTLE = 8.0          # Post-squeeze relaxation window
+N_CLIPS_PER_CONDITION = 20     # 20 climbing + 20 everyday = 40 trials total
 
 # --- DISPLAY PARAMETERS ---
 BG_COLOR = [0, 0, 0]           # Neutral grey in PsychoPy (-1 to 1 scale)
 TEXT_COLOR = [1, 1, 1]         # White text/cross
 VIDEO_SIZE = (1.2, 0.675)      # 16:9 aspect ratio in 'height' units
-WINDOW_SIZE = [1920, 1200]     # Matches your actual 1920x1200 display
+WINDOW_SIZE = [1920, 1200]     # Native display resolution
 FULLSCREEN = True
 SCREEN_NUM = 0
 
 # --- LIVE TRIGGER CONFIGURATION ---
-# Trigger modes supported: "none" (offline only), "serial" (COM/USB/BT), "lsl" (LabStreamingLayer), "parallel" (TTL)
-DEFAULT_SERIAL_PORT = "COM3"   # Change to e.g. "/dev/ttyUSB0" or "/dev/rfcomm0" on Linux/macOS
+DEFAULT_SERIAL_PORT = "COM3"
 SERIAL_BAUDRATE = 115200
 PARALLEL_PORT_ADDRESS = 0x0378
 
-# Standardized Trigger Codes (sent on exact frame flip)
 TRIGGER_CODES = {
-    "sync_onset": 1,
-    "sync_offset": 2,
+    "sync_start_onset": 1,
+    "sync_start_offset": 2,
     "baseline_onset": 10,
     "baseline_offset": 11,
     "climbing_onset": 21,
     "everyday_onset": 22,
     "video_offset_isi_onset": 30,
     "isi_offset": 31,
+    "sync_end_onset": 90,
+    "sync_end_offset": 91,
     "experiment_end": 99
 }
 
-# --- SIGNAL PROCESSING PARAMETERS ---
-# Filter Cascade Parameters (Clancy et al., 2002 / Protocol Section 5)
-BANDPASS_LOW = 20.0            # Hz (High-pass cutoff for motion artifacts)
-BANDPASS_HIGH = 500.0          # Hz (Low-pass cutoff for thermal noise)
-FILTER_ORDER = 4               # 4th-order Butterworth (8th-order zero-phase via filtfilt)
-NOTCH_FREQ = 50.0              # Hz (European power line interference)
-NOTCH_Q = 30.0                 # Quality factor for narrow 50Hz notch (+ harmonics)
-ENVELOPE_LOWPASS = 8.0         # Hz (Smooths rectified signal into linear envelope)
-
-# --- APPEND TO config.py ---
-EPOCHS_DIR = DATA_DIR / "epochs"
-EPOCHS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Default Shimmer EMG settings (auto-detected from timestamps, used as fallback)
-DEFAULT_SAMPLING_RATE = 2048.0  # Hz (Standard Shimmer3 EMG sampling rate: 512, 1024, or 2048 Hz)
+# --- DUAL-CHANNEL SHIMMER EMG MAPPING ---
+DEFAULT_SAMPLING_RATE = 2048.0  # Hz (Fallback if Shimmer timestamp is -1)
 
 EMG_CHANNEL_MAP = {
     "ch1": {
@@ -86,6 +73,14 @@ EMG_CHANNEL_MAP = {
         "col_keywords": ["EMG_CH2_16BIT_CAL", "EMG_CH2_24BIT_CAL", "EMG_CH2", "EXG1_CH2"]
     }
 }
+
+# --- SIGNAL PROCESSING PARAMETERS (Clancy et al., 2002 / Protocol Section 5) ---
+BANDPASS_LOW = 20.0            # Hz (High-pass cutoff for motion artifacts)
+BANDPASS_HIGH = 500.0          # Hz (Low-pass cutoff for thermal noise)
+FILTER_ORDER = 4               # 4th-order Butterworth (8th-order zero-phase via filtfilt)
+NOTCH_FREQ = 50.0              # Hz (European power line interference)
+NOTCH_Q = 30.0                 # Quality factor for 50Hz notch (+ harmonics)
+ENVELOPE_LOWPASS = 8.0         # Hz (Smooths rectified signal into linear envelope)
 
 # Common column substrings exported by Shimmer Consensys software
 SHIMMER_TIME_COLS = [
