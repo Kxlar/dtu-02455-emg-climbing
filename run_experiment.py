@@ -392,7 +392,7 @@ def run_experiment():
 
     # --- STEP C: 30-SECOND RESTING BASELINE (+ PRE-DECODE TRIAL 1 IN RAM) ---
     instr_text.text = (
-        "PHASE 1: RESTING BASELINE (30 seconds)\n\n"
+        f"PHASE 1: RESTING BASELINE ({config.BASELINE_DURATION} seconds)\n\n"
         "Please keep your arm completely still and relaxed, "
         "and look passively at the central fixation cross.\n\n"
         "Press SPACE to start the baseline recording."
