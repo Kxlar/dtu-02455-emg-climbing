@@ -1,0 +1,46 @@
+# --- Virtual Environments & Python Cache ---
+venv_ExpCogSc/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Experiment Results & Data Files ---
+data/
+*.csv
+*.tsv
+*.pkl
+*.parquet
+*.json
+
+# --- Figures & Plots ---
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# --- Video Stimuli & Backups ---
+stimuli/
+*.mp4
+*.wmv
+*.mov
+*.avi
+*.mkv
+*.webm
+*.flv
+*.mpg
+*.mpeg
+*.m4v
+
+# --- OS & IDE Files ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Exceptions (Keep empty directory structure & requirements) ---
+!.gitkeep
+!requirements.txt
+!README.md
