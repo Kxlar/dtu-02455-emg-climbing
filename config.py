@@ -26,7 +26,7 @@ for d in [CLIMBING_DIR, EVERYDAY_DIR, LOG_DIR, RAW_SHIMMER_DIR, PROCESSED_DIR, E
 BASELINE_DURATION = 10.0       # 10s resting baseline
 ISI_MIN = 4.0                  # Minimum jittered Inter-Stimulus Interval
 ISI_MAX = 7.0                  # Maximum jittered Inter-Stimulus Interval
-N_CLIPS_PER_CONDITION = 4     # 15 climbing + 15 everyday = 30 trials total
+N_CLIPS_PER_CONDITION = 20     # n climbing + n everyday = 2n trials total
 
 # --- DISPLAY PARAMETERS ---
 BG_COLOR = [0, 0, 0]           # Neutral grey in PsychoPy (-1 to 1 scale)
