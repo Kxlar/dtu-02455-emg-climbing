@@ -543,7 +543,22 @@ def run_experiment():
         ))
         pd.DataFrame(event_log).to_csv(csv_log_path, index=False)
 
-    # --- 6. AUTOMATIC END-OF-SESSION BOOKEND SQUEEZE (config.SYNC_SQUEEZE_DURATION) ---
+    # --- 6. AUTOMATIC END-OF-SESSION BOOKEND SQUEEZE (WITH PREPARATION COUNTDOWN) ---
+    # A. Brief preparation countdown so the participant is ready for the final squeeze
+    end_cd_timer = core.CountdownTimer(config.SYNC_COUNTDOWN_DURATION)
+    while end_cd_timer.getTime() > 0:
+        rem_end = int(np.ceil(end_cd_timer.getTime()))
+        instr_text.text = (
+            f"All video trials complete!\n\n"
+            f"Get ready for the final calibration squeeze in...\n\n"
+            f"{rem_end}"
+        )
+        instr_text.color = config.TEXT_COLOR
+        instr_text.draw()
+        win.flip()
+        check_abort(win, event_log, csv_log_path, trigger_mgr)
+
+    # B. Final Squeeze Onset
     sync_end_times = {}
     instr_text.text = f"FINAL CALIBRATION:\nSQUEEZE HARD NOW! ({sq_str}s)"
     instr_text.color = [1, -0.4, -0.4]
@@ -560,6 +575,7 @@ def run_experiment():
         win.flip()
         check_abort(win, event_log, csv_log_path, trigger_mgr)
 
+    # C. Squeeze Offset & Save
     instr_text.text = "RELAX.\nSaving session logs..."
     instr_text.color = config.TEXT_COLOR
     instr_text.draw()
