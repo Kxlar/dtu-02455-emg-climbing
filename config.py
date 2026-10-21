@@ -69,7 +69,20 @@ EPOCHS_DIR = DATA_DIR / "epochs"
 EPOCHS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Default Shimmer EMG settings (auto-detected from timestamps, used as fallback)
-DEFAULT_SAMPLING_RATE = 1024.0  # Hz (Standard Shimmer3 EMG sampling rate: 512, 1024, or 2048 Hz)
+DEFAULT_SAMPLING_RATE = 2048.0  # Hz (Standard Shimmer3 EMG sampling rate: 512, 1024, or 2048 Hz)
+
+EMG_CHANNEL_MAP = {
+    "ch1": {
+        "muscle_code": "FDS",
+        "muscle_name": "Flexor Digitorum Superficialis (CH1)",
+        "col_keywords": ["EMG_CH1_16BIT_CAL", "EMG_CH1_24BIT_CAL", "EMG_CH1", "EXG1_CH1"]
+    },
+    "ch2": {
+        "muscle_code": "ECR",
+        "muscle_name": "Extensor Carpi Radialis (CH2)",
+        "col_keywords": ["EMG_CH2_16BIT_CAL", "EMG_CH2_24BIT_CAL", "EMG_CH2", "EXG1_CH2"]
+    }
+}
 
 # Common column substrings exported by Shimmer Consensys software
 SHIMMER_TIME_COLS = [

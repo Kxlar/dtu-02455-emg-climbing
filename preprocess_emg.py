@@ -3,226 +3,398 @@ import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from scipy import signal
 
 import config
 
 
-def load_shimmer_file(filepath: Path, time_col_override: str = None, emg_col_override: str = None):
+def load_shimmer_file(filepath: Path, default_fs: float = config.DEFAULT_SAMPLING_RATE):
     """
-    Robustly loads a Shimmer Consensys exported CSV/TSV file.
-    Handles 'sep=' headers, multi-row headers (column names + units row),
-    and auto-detects the Unix timestamp (ms) and EMG (mV) columns.
+    Loads a Shimmer Consensys SD-card CSV/TSV file matching the exact structure of:
+      "sep=\\t"
+      Shimmer_9BF9_Timestamp_Unix_CAL  ...  Shimmer_9BF9_EMG_CH1_16BIT_CAL  Shimmer_9BF9_EMG_CH2_16BIT_CAL
+      ms                               ...  mV                              mV
+      -1                               ...  -19.07915                       -1.95099
+    Extracts:
+      - sample_idx (0 .. N-1)
+      - timestamp_raw (-1 if offline SD mode, or Unix ms if docked/synced)
+      - emg_ch1 (FDS: Flexor Digitorum Superficialis)
+      - emg_ch2 (ECR: Extensor Carpi Radialis)
+      - accel_mag (3-axis accelerometer magnitude for movement/tap inspection)
     """
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"Shimmer file not found: {filepath}")
 
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        first_lines = [f.readline().strip() for _ in range(5)]
+        first_line = f.readline().strip()
 
-    skiprows = 0
-    sep = "\t" if "\t" in first_lines[1] else ","
+    skiprows = 1 if "sep=" in first_line else 0
+    df_raw = pd.read_csv(filepath, sep="\t", skiprows=skiprows, low_memory=False)
 
-    if first_lines[0].startswith("sep="):
-        sep_char = first_lines[0].split("=")[1].strip()
-        if sep_char == "\\t" or sep_char == "":
-            sep = "\t"
-        else:
-            sep = sep_char
-        skiprows = 1
-
-    df_raw = pd.read_csv(filepath, sep=sep, skiprows=skiprows, low_memory=False)
-
-    # Shimmer Consensys exports often put units (e.g. 'ms', 'mV', 'no_units') in row 0
-    first_val = str(df_raw.iloc[0, 0]).strip().lower()
-    if any(u in first_val for u in ["ms", "sec", "no_units", "mv", "cal", "unix"]):
-        df_raw = df_raw.iloc[1:].reset_index(drop=True)
-
+    # Drop empty trailing columns (Shimmer often exports a trailing tab creating 'Unnamed: 8')
+    df_raw = df_raw.loc[:, ~df_raw.columns.str.contains("^Unnamed")]
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
+    # Drop the units row (row 0 contains 'ms', 'm/(s^2)', 'mV', 'no_units')
+    if len(df_raw) > 0 and any(u in str(df_raw.iloc[0, 0]).lower() for u in ["ms", "sec", "mv", "no_units"]):
+        df_raw = df_raw.iloc[1:].reset_index(drop=True)
+
     # 1. Identify Timestamp Column
-    time_col = time_col_override
-    if time_col is None:
-        for candidate in config.SHIMMER_TIME_COLS:
-            matches = [c for c in df_raw.columns if candidate.lower() in c.lower()]
-            if matches:
-                time_col = matches[0]
-                break
-    if time_col is None or time_col not in df_raw.columns:
-        raise ValueError(
-            f"Could not auto-detect timestamp column in {filepath.name}. "
-            f"Available columns: {list(df_raw.columns)}"
-        )
+    time_col = next((c for c in df_raw.columns if "timestamp" in c.lower()), None)
 
-    # 2. Identify EMG Channel Column(s)
-    emg_cols = []
-    if emg_col_override:
-        emg_cols = [emg_col_override]
-    else:
-        for candidate in config.SHIMMER_EMG_COLS:
-            matches = [c for c in df_raw.columns if candidate.lower() in c.lower() and "status" not in c.lower()]
-            for m in matches:
-                if m not in emg_cols:
-                    emg_cols.append(m)
+    # 2. Identify CH1 (FDS) and CH2 (ECR) EMG Columns
+    ch1_col = next(
+        (c for c in df_raw.columns if any(k.lower() in c.lower() for k in config.EMG_CHANNEL_MAP["ch1"]["col_keywords"])),
+        None
+    )
+    ch2_col = next(
+        (c for c in df_raw.columns if any(k.lower() in c.lower() for k in config.EMG_CHANNEL_MAP["ch2"]["col_keywords"])),
+        None
+    )
 
-    if not emg_cols:
+    if ch1_col is None and ch2_col is None:
         raise ValueError(
-            f"Could not auto-detect EMG channel column in {filepath.name}. "
+            f"Could not find EMG_CH1 or EMG_CH2 columns in {filepath.name}.\n"
             f"Available columns: {list(df_raw.columns)}"
         )
 
     clean_df = pd.DataFrame()
-    clean_df["timestamp_raw"] = pd.to_numeric(df_raw[time_col], errors="coerce")
-
-    for idx, col in enumerate(emg_cols, start=1):
-        clean_df[f"emg_ch{idx}"] = pd.to_numeric(df_raw[col], errors="coerce")
-
-    trig_matches = [c for c in df_raw.columns if any(k in c.lower() for k in ["marker", "trigger", "event"])]
-    if trig_matches:
-        clean_df["shimmer_trigger"] = pd.to_numeric(df_raw[trig_matches[0]], errors="coerce").fillna(0).astype(int)
-
-    clean_df = clean_df.dropna(subset=["timestamp_raw", "emg_ch1"]).reset_index(drop=True)
-
-    median_ts = clean_df["timestamp_raw"].median()
-    if 1e9 < median_ts < 1e11:
-        clean_df["timestamp_unix_ms"] = clean_df["timestamp_raw"] * 1000.0
+    if time_col:
+        clean_df["timestamp_raw"] = pd.to_numeric(df_raw[time_col], errors="coerce").fillna(-1.0)
     else:
-        clean_df["timestamp_unix_ms"] = clean_df["timestamp_raw"]
+        clean_df["timestamp_raw"] = -1.0
 
-    dt_ms = np.median(np.diff(clean_df["timestamp_unix_ms"].values))
-    fs_estimated = round(1000.0 / dt_ms, 2) if dt_ms > 0 else config.DEFAULT_SAMPLING_RATE
+    if ch1_col:
+        clean_df["emg_ch1"] = pd.to_numeric(df_raw[ch1_col], errors="coerce")
+    if ch2_col:
+        clean_df["emg_ch2"] = pd.to_numeric(df_raw[ch2_col], errors="coerce")
+
+    # 3. Extract 3-Axis Low-Noise Accelerometer Magnitude (if present)
+    acc_cols = [c for c in df_raw.columns if "accel" in c.lower()]
+    if len(acc_cols) >= 3:
+        ax = pd.to_numeric(df_raw[acc_cols[0]], errors="coerce").fillna(0.0)
+        ay = pd.to_numeric(df_raw[acc_cols[1]], errors="coerce").fillna(0.0)
+        az = pd.to_numeric(df_raw[acc_cols[2]], errors="coerce").fillna(0.0)
+        clean_df["accel_mag"] = np.sqrt(ax**2 + ay**2 + az**2)
+
+    emg_present = [c for c in ["emg_ch1", "emg_ch2"] if c in clean_df.columns]
+    clean_df = clean_df.dropna(subset=emg_present).reset_index(drop=True)
+    clean_df["sample_idx"] = np.arange(len(clean_df), dtype=np.int64)
+
+    # 4. Check if timestamps are offline (-1) or valid Unix timestamps (> 0)
+    valid_ts_mask = clean_df["timestamp_raw"] > 0
+    if valid_ts_mask.sum() > len(clean_df) * 0.5:
+        offline_sd_mode = False
+        med_ts = clean_df.loc[valid_ts_mask, "timestamp_raw"].median()
+        clean_df["timestamp_unix_ms"] = (
+            clean_df["timestamp_raw"] * 1000.0 if med_ts < 1e11 else clean_df["timestamp_raw"]
+        )
+        dt_ms = np.median(np.diff(clean_df["timestamp_unix_ms"].values))
+        fs_est = round(1000.0 / dt_ms, 2) if dt_ms > 0 else float(default_fs)
+    else:
+        offline_sd_mode = True
+        fs_est = float(default_fs)
+        clean_df["timestamp_unix_ms"] = -1.0
 
     print(f"[SHIMMER LOADED] {filepath.name}")
-    print(f"  -> Time Column : '{time_col}' | EMG Columns: {emg_cols}")
-    print(f"  -> Total Samples: {len(clean_df):,} | Estimated Sampling Rate: {fs_estimated} Hz")
+    print(f"  -> CH1 (FDS) Col : {ch1_col}")
+    print(f"  -> CH2 (ECR) Col : {ch2_col}")
+    print(f"  -> Total Samples : {len(clean_df):,} ({len(clean_df)/fs_est:.1f}s @ {fs_est} Hz)")
+    print(f"  -> Clock Mode    : {'OFFLINE SD (-1 timestamps -> Squeeze Sync)' if offline_sd_mode else 'UNIX TIMESTAMP'}")
 
-    return clean_df, fs_estimated, emg_cols
+    return clean_df, fs_est, offline_sd_mode
 
 
-def compute_clock_offset_from_sync_squeeze(
+def compute_combined_squeeze_snr(shimmer_df: pd.DataFrame, fs: float) -> np.ndarray:
+    """
+    Computes a combined Signal-to-Noise Ratio (SNR) burst envelope across CH1 (FDS) and CH2 (ECR)
+    to reliably locate the high-amplitude calibration fist squeezes (t=0 Start Squeeze & End Squeeze).
+    Steps:
+      1. 20 Hz High-Pass Butterworth filter (removes the -19 mV / -2 mV DC offsets & drift)
+      2. 200 ms Moving RMS window
+      3. Robust Z-score against the recording's median resting noise floor (MAD)
+    """
+    sos_hp = signal.butter(4, 20.0, btype="highpass", fs=fs, output="sos")
+    win_samples = max(int(0.20 * fs), 10)
+    kernel = np.ones(win_samples) / win_samples
+
+    combined_snr = np.zeros(len(shimmer_df), dtype=np.float64)
+    n_chs = 0
+
+    for col in ["emg_ch1", "emg_ch2"]:
+        if col in shimmer_df.columns:
+            raw = shimmer_df[col].values.astype(np.float64)
+            hp = signal.sosfiltfilt(sos_hp, raw - np.mean(raw))
+            rms = np.sqrt(np.convolve(hp**2, kernel, mode="same"))
+            med = np.median(rms)
+            robust_sd = max(np.median(np.abs(rms - med)) * 1.4826, 1e-6)
+            combined_snr += (rms - med) / robust_sd
+            n_chs += 1
+
+    return combined_snr / max(n_chs, 1)
+
+
+def detect_squeeze_anchor_and_fs(
     shimmer_df: pd.DataFrame,
     events_df: pd.DataFrame,
-    fs: float,
-    search_window_s: float = 15.0
-) -> float:
+    initial_fs: float,
+    manual_t0_sec: float = None
+) -> tuple[int, float]:
     """
-    Finds the high-amplitude calibration fist squeeze in the Shimmer trace around the
-    expected 'sync_marker' timestamp and returns the clock offset (ms) to add to
-    PsychoPy timestamps so they align with the Shimmer clock.
+    Locates the exact sample index of the Start Squeeze (t = 0.0s) in the Shimmer recording
+    and (if a 'sync_end' squeeze is present) recalibrates the true sampling rate `fs`.
     """
-    sync_rows = events_df[events_df["event_type"] == "sync_marker"]
-    if sync_rows.empty:
-        print("  [SYNC] No 'sync_marker' row in PsychoPy log. Using direct Unix clock (offset = 0 ms).")
-        return 0.0
+    if manual_t0_sec is not None:
+        idx_0 = int(round(manual_t0_sec * initial_fs))
+        print(f"  [MANUAL SYNC OVERRIDE] Using t=0 at {manual_t0_sec:.2f}s (Sample Index = {idx_0:,})")
+        return idx_0, float(initial_fs)
 
-    expected_onset_ms = float(sync_rows.iloc[0]["onset_unix_ms"])
-    expected_offset_ms = float(sync_rows.iloc[0]["offset_unix_ms"])
-    expected_center_ms = 0.5 * (expected_onset_ms + expected_offset_ms)
+    env_snr = compute_combined_squeeze_snr(shimmer_df, fs=initial_fs)
+    n_total = len(env_snr)
 
-    win_ms = search_window_s * 1000.0
-    sub_df = shimmer_df[
-        (shimmer_df["timestamp_unix_ms"] >= expected_onset_ms - win_ms) &
-        (shimmer_df["timestamp_unix_ms"] <= expected_offset_ms + win_ms)
-    ].copy()
+    # 1. Search the first 120 seconds (or first 45% of recording) for the Start Squeeze burst
+    search_end_idx = min(int(120.0 * initial_fs), int(n_total * 0.45))
+    search_end_idx = max(search_end_idx, min(n_total, int(10.0 * initial_fs)))
+    early_env = env_snr[:search_end_idx]
 
-    if sub_df.empty:
-        print("  [WARNING] Sync squeeze window outside Shimmer recording range! Falling back to offset = 0 ms.")
-        return 0.0
+    # A voluntary calibration squeeze has an SNR > 10-50x resting baseline;
+    # find the first major peak exceeding 35% of the maximum early burst (minimum SNR = 6.0)
+    max_early = float(np.max(early_env))
+    thresh_peak = max(max_early * 0.35, 6.0)
+    peaks, _ = signal.find_peaks(early_env, height=thresh_peak, distance=int(1.0 * initial_fs))
 
-    sig = sub_df["emg_ch1"].values - np.median(sub_df["emg_ch1"].values)
-    win_samples = max(int(0.25 * fs), 10)
-    rms_env = np.sqrt(np.convolve(sig ** 2, np.ones(win_samples) / win_samples, mode="same"))
+    first_peak_idx = int(peaks[0]) if len(peaks) > 0 else int(np.argmax(early_env))
 
-    peak_idx = int(np.argmax(rms_env))
-    actual_peak_ms = float(sub_df.iloc[peak_idx]["timestamp_unix_ms"])
+    # Walk backward from the squeeze peak (up to 1.2s) to find the exact rising-edge onset (20% of peak height)
+    peak_height = env_snr[first_peak_idx]
+    onset_threshold = max(peak_height * 0.20, 3.0)
+    lookback_start = max(0, first_peak_idx - int(1.2 * initial_fs))
+    pre_segment = env_snr[lookback_start:first_peak_idx]
+    below_indices = np.where(pre_segment <= onset_threshold)[0]
 
-    offset_ms = actual_peak_ms - expected_center_ms
-    print(f"  [SYNC SQUEEZE ALIGNED] Detected burst peak drift: {offset_ms:+.1f} ms")
-    return offset_ms
+    if len(below_indices) > 0:
+        start_squeeze_idx = lookback_start + int(below_indices[-1])
+    else:
+        start_squeeze_idx = max(0, first_peak_idx - int(0.35 * initial_fs))
+
+    # Account for typical human visual reaction time (~0.25s between screen flash 'SQUEEZE NOW' and muscle onset)
+    reaction_comp_samples = int(0.25 * initial_fs)
+    t0_anchor_idx = max(0, start_squeeze_idx - reaction_comp_samples)
+
+    print(
+        f"  [START SQUEEZE DETECTED] Rising edge at idx {start_squeeze_idx:,} "
+        f"({start_squeeze_idx / initial_fs:.2f}s) -> Screen t=0 anchor set to idx {t0_anchor_idx:,} "
+        f"({t0_anchor_idx / initial_fs:.2f}s)"
+    )
+
+    # 2. Optional Two-Point Bookend Calibration: Check for 'sync_end' at end of experiment
+    calibrated_fs = float(initial_fs)
+    end_rows = events_df[events_df["event_type"] == "sync_end"]
+
+    if not end_rows.empty and "rel_from_sync_onset_s" in end_rows.columns:
+        expected_rel_end_s = float(end_rows.iloc[0]["rel_from_sync_onset_s"])
+        expected_end_idx = t0_anchor_idx + int(round(expected_rel_end_s * initial_fs))
+
+        # Search +/- 12 seconds around expected end squeeze location
+        tol_samples = int(12.0 * initial_fs)
+        w_start = max(t0_anchor_idx + int(15.0 * initial_fs), expected_end_idx - tol_samples)
+        w_end = min(n_total, expected_end_idx + tol_samples)
+
+        if w_end > w_start + int(1.0 * initial_fs):
+            end_env = env_snr[w_start:w_end]
+            if np.max(end_env) > 6.0:
+                end_peak_idx = w_start + int(np.argmax(end_env))
+                ep_height = env_snr[end_peak_idx]
+                eb_lookback = max(w_start, end_peak_idx - int(1.2 * initial_fs))
+                eb_below = np.where(env_snr[eb_lookback:end_peak_idx] <= max(ep_height * 0.20, 3.0))[0]
+                end_rising_idx = (eb_lookback + int(eb_below[-1])) if len(eb_below) > 0 else end_peak_idx
+                end_anchor_idx = max(w_start, end_rising_idx - reaction_comp_samples)
+
+                calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
+                print(
+                    f"  [BOOKEND DRIFT CALIBRATED] End Squeeze detected at idx {end_rising_idx:,} "
+                    f"(Elapsed = {expected_rel_end_s:.2f}s) -> Empirical Shimmer fs = {calibrated_fs:.3f} Hz"
+                )
+
+    return t0_anchor_idx, calibrated_fs
 
 
 def slice_emg_epochs(
     shimmer_df: pd.DataFrame,
     events_df: pd.DataFrame,
-    fs: float,
-    sync_method: str = "unix"
-) -> pd.DataFrame:
+    initial_fs: float,
+    manual_t0_sec: float = None
+) -> tuple[pd.DataFrame, float]:
     """
-    Slices the continuous Shimmer EMG DataFrame into labeled segments corresponding to
-    every row in the PsychoPy events log (baseline, trial_video, isi).
+    Slices the continuous Shimmer DataFrame into labeled segments (baseline, trial_video, isi)
+    using the continuous relative timestamps (`rel_from_sync_onset_s` and `rel_from_sync_offset_s`)
+    locked to the Start Squeeze at t = 0.0s.
+    Extracts BOTH `emg_ch1` (FDS) and `emg_ch2` (ECR) for every epoch.
     """
-    clock_offset_ms = 0.0
-    if sync_method == "sync_squeeze":
-        clock_offset_ms = compute_clock_offset_from_sync_squeeze(shimmer_df, events_df, fs)
+    events_df = events_df.copy()
 
-    ts_array = shimmer_df["timestamp_unix_ms"].values
-    emg_cols = [c for c in shimmer_df.columns if c.startswith("emg_ch")]
+    # Backwards compatibility: if an older log doesn't have `rel_from_sync_onset_s`, compute it from `onset_psychopy_s`
+    if "rel_from_sync_onset_s" not in events_df.columns:
+        sync_rows = events_df[events_df["event_type"].isin(["sync_start", "sync_marker"])]
+        t0_psy = float(sync_rows["onset_psychopy_s"].iloc[0]) if not sync_rows.empty else float(events_df["onset_psychopy_s"].iloc[0])
+        events_df["rel_from_sync_onset_s"] = events_df["onset_psychopy_s"] - t0_psy
+        events_df["rel_from_sync_offset_s"] = events_df["offset_psychopy_s"] - t0_psy
+
+    t0_anchor_idx, calibrated_fs = detect_squeeze_anchor_and_fs(
+        shimmer_df, events_df, initial_fs=initial_fs, manual_t0_sec=manual_t0_sec
+    )
+
+    n_total_samples = len(shimmer_df)
+    emg_cols = [c for c in ["emg_ch1", "emg_ch2"] if c in shimmer_df.columns]
+    has_accel = "accel_mag" in shimmer_df.columns
 
     sliced_epochs = []
 
     for _, row in events_df.iterrows():
-        ev_type = row["event_type"]
-        onset_ms = float(row["onset_unix_ms"]) + clock_offset_ms
-        offset_ms = float(row["offset_unix_ms"]) + clock_offset_ms
+        rel_onset_s = float(row["rel_from_sync_onset_s"])
+        rel_offset_s = float(row["rel_from_sync_offset_s"])
 
-        idx_start = int(np.searchsorted(ts_array, onset_ms, side="left"))
-        idx_end = int(np.searchsorted(ts_array, offset_ms, side="right"))
+        idx_start = t0_anchor_idx + int(round(rel_onset_s * calibrated_fs))
+        idx_end = t0_anchor_idx + int(round(rel_offset_s * calibrated_fs))
 
-        segment = shimmer_df.iloc[idx_start:idx_end].copy()
-        n_samples = len(segment)
+        idx_start_clamped = max(0, min(idx_start, n_total_samples))
+        idx_end_clamped = max(0, min(idx_end, n_total_samples))
 
-        if n_samples == 0:
+        if idx_end_clamped <= idx_start_clamped:
             print(
-                f"  [WARNING] Empty EMG slice for {ev_type} (trial {row['trial_num']}, "
-                f"{row['stimulus_file']}). Check clock synchronization!"
+                f"  [WARNING] Epoch '{row['event_type']}' (trial {row['trial_num']}) at "
+                f"t=+{rel_onset_s:.1f}..{rel_offset_s:.1f}s is beyond Shimmer recording end. Skipping."
             )
             continue
 
-        rel_time_s = (segment["timestamp_unix_ms"].values - onset_ms) / 1000.0
+        segment = shimmer_df.iloc[idx_start_clamped:idx_end_clamped]
+        n_samples = len(segment)
+        rel_time_s = np.arange(n_samples, dtype=np.float64) / calibrated_fs
 
         epoch_record = {
             "participant_id": row["participant_id"],
             "expertise_group": row["expertise_group"],
             "dominant_hand": row["dominant_hand"],
             "seed": int(row["seed"]),
-            "event_type": ev_type,
+            "event_type": row["event_type"],
             "trial_num": int(row["trial_num"]),
             "condition": row["condition"],
             "stimulus_file": row["stimulus_file"],
+            "rel_from_sync_onset_s": round(rel_onset_s, 4),
+            "rel_from_sync_offset_s": round(rel_offset_s, 4),
             "target_duration_s": float(row["target_duration_s"]),
             "actual_duration_s": float(row["actual_duration_s"]),
-            "onset_unix_ms_aligned": onset_ms,
-            "offset_unix_ms_aligned": offset_ms,
-            "clock_offset_applied_ms": clock_offset_ms,
-            "sampling_rate_hz": fs,
+            "start_sample_idx": idx_start_clamped,
+            "end_sample_idx": idx_end_clamped,
+            "sampling_rate_hz": round(calibrated_fs, 3),
             "n_samples": n_samples,
             "time_s": rel_time_s,
         }
 
+        # Store both FDS (emg_ch1) and ECR (emg_ch2) arrays
         for col in emg_cols:
-            epoch_record[col] = segment[col].values
+            epoch_record[col] = segment[col].values.astype(np.float64)
+
+        if has_accel:
+            epoch_record["accel_mag"] = segment["accel_mag"].values.astype(np.float64)
 
         sliced_epochs.append(epoch_record)
 
-    return pd.DataFrame(sliced_epochs)
+    return pd.DataFrame(sliced_epochs), calibrated_fs
+
+
+def save_sync_alignment_plot(shimmer_df: pd.DataFrame, epochs_df: pd.DataFrame, fs: float, sub_id: str):
+    """
+    Saves a 2-panel diagnostic figure in ./data/epochs/<sub_id>_sync_alignment_check.png
+    showing the full CH1 (FDS) and CH2 (ECR) traces with shaded overlays for:
+      - Red   : Start & End Calibration Squeezes
+      - Green : 30s Resting Baseline
+      - Orange: Climbing Video Trials
+      - Purple: Everyday Video Trials
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+    except ImportError:
+        return
+
+    t_full = np.arange(len(shimmer_df)) / fs
+    fig, axes = plt.subplots(2, 1, figsize=(14, 6.2), sharex=True)
+    fig.suptitle(
+        f"Squeeze-Locked Synchronization & Dual-Channel Slicing Verification — {sub_id} (fs = {fs:.2f} Hz)",
+        fontsize=12, fontweight="bold"
+    )
+
+    ch_specs = [
+        ("emg_ch1", "CH1: FDS (mV)\n[Finger Flexor]", "#0072B2"),
+        ("emg_ch2", "CH2: ECR (mV)\n[Wrist Extensor]", "#D55E00")
+    ]
+
+    for idx, (col, label, color) in enumerate(ch_specs):
+        ax = axes[idx]
+        if col not in shimmer_df.columns:
+            continue
+        # Remove static DC offset (-19mV / -2mV) for clean visual inspection
+        sig = shimmer_df[col].values - np.mean(shimmer_df[col].values)
+        ax.plot(t_full, sig, color=color, lw=0.45, alpha=0.85)
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.25)
+
+        for _, ep in epochs_df.iterrows():
+            t0 = ep["start_sample_idx"] / fs
+            t1 = ep["end_sample_idx"] / fs
+            ev = ep["event_type"]
+            if ev in ("sync_start", "sync_end", "sync_marker"):
+                ax.axvspan(t0, t1, color="#d62728", alpha=0.30)
+            elif ev == "baseline":
+                ax.axvspan(t0, t1, color="#2ca02c", alpha=0.22)
+            elif ev == "trial_video":
+                span_col = "#ff7f0e" if ep["condition"] == "climbing" else "#9467bd"
+                ax.axvspan(t0, t1, color=span_col, alpha=0.25)
+
+    legend_patches = [
+        mpatches.Patch(color="#d62728", alpha=0.35, label="Sync Squeeze (t=0 / End)"),
+        mpatches.Patch(color="#2ca02c", alpha=0.30, label="30s Resting Baseline"),
+        mpatches.Patch(color="#ff7f0e", alpha=0.35, label="Climbing Video Trial"),
+        mpatches.Patch(color="#9467bd", alpha=0.35, label="Everyday Video Trial"),
+    ]
+    axes[0].legend(handles=legend_patches, loc="upper right", ncol=4, fontsize=8.5, frameon=True)
+    axes[-1].set_xlabel("Shimmer Recording Time from File Start (seconds)")
+
+    plt.tight_layout()
+    out_plot = config.EPOCHS_DIR / f"{sub_id}_sync_alignment_check.png"
+    plt.savefig(out_plot, dpi=160)
+    plt.close(fig)
+    print(f"  [SYNC CHECK PLOT] {out_plot.name}")
 
 
 def preprocess_participant(
     events_csv_path: Path,
     shimmer_file_path: Path,
-    sync_method: str = "unix",
+    fs_override: float = None,
+    manual_t0_sec: float = None,
     export_individual_csvs: bool = False
 ):
     events_df = pd.read_csv(events_csv_path)
     sub_id = str(events_df["participant_id"].iloc[0])
     group = str(events_df["expertise_group"].iloc[0])
 
-    print(f"\n==========================================")
-    print(f"Preprocessing Participant: {sub_id} ({group})")
-    print(f"==========================================")
+    if fs_override is not None:
+        cfg_fs = float(fs_override)
+    elif "shimmer_fs_configured_hz" in events_df.columns:
+        cfg_fs = float(events_df["shimmer_fs_configured_hz"].iloc[0])
+    else:
+        cfg_fs = config.DEFAULT_SAMPLING_RATE
 
-    shimmer_df, fs, _ = load_shimmer_file(shimmer_file_path)
-    epochs_df = slice_emg_epochs(shimmer_df, events_df, fs, sync_method=sync_method)
+    print(f"\n=======================================================")
+    print(f"Preprocessing Participant: {sub_id} ({group})")
+    print(f"=======================================================")
+
+    shimmer_df, fs_est, _ = load_shimmer_file(shimmer_file_path, default_fs=cfg_fs)
+    epochs_df, calibrated_fs = slice_emg_epochs(
+        shimmer_df, events_df, initial_fs=fs_est, manual_t0_sec=manual_t0_sec
+    )
 
     if epochs_df.empty:
         raise RuntimeError(f"No valid epochs were extracted for {sub_id}!")
@@ -230,170 +402,139 @@ def preprocess_participant(
     out_pkl = config.EPOCHS_DIR / f"{sub_id}_{group}_epochs.pkl"
     epochs_df.to_pickle(out_pkl)
 
-    summary_cols = [c for c in epochs_df.columns if not c.startswith("emg_ch") and c != "time_s"]
+    summary_cols = [
+        c for c in epochs_df.columns
+        if not c.startswith("emg_ch") and c not in ("time_s", "accel_mag")
+    ]
     out_summary_csv = config.EPOCHS_DIR / f"{sub_id}_{group}_epochs_summary.csv"
     epochs_df[summary_cols].to_csv(out_summary_csv, index=False)
 
-    print(f"  [SAVED] {len(epochs_df)} epochs -> {out_pkl.name}")
-    print(f"  [SAVED] Quality summary -> {out_summary_csv.name}")
+    save_sync_alignment_plot(shimmer_df, epochs_df, calibrated_fs, sub_id)
+
+    print(f"  [SAVED] {len(epochs_df)} dual-channel epochs (CH1 FDS + CH2 ECR) -> {out_pkl.name}")
+    print(f"  [SAVED] Epoch summary table -> {out_summary_csv.name}")
 
     if export_individual_csvs:
         sub_epoch_dir = config.EPOCHS_DIR / f"{sub_id}_csv_segments"
         sub_epoch_dir.mkdir(parents=True, exist_ok=True)
         for _, ep in epochs_df.iterrows():
-            ep_df = pd.DataFrame({
-                "time_s": ep["time_s"],
-                "emg_ch1": ep["emg_ch1"]
-            })
+            seg_dict = {"time_s": ep["time_s"]}
+            if "emg_ch1" in ep:
+                seg_dict["emg_ch1_FDS_mV"] = ep["emg_ch1"]
+            if "emg_ch2" in ep:
+                seg_dict["emg_ch2_ECR_mV"] = ep["emg_ch2"]
             fname = f"trial{ep['trial_num']:02d}_{ep['event_type']}_{ep['condition']}_{Path(ep['stimulus_file']).stem}.csv"
-            ep_df.to_csv(sub_epoch_dir / fname, index=False)
-        print(f"  [SAVED] Individual epoch CSVs -> {sub_epoch_dir}")
+            pd.DataFrame(seg_dict).to_csv(sub_epoch_dir / fname, index=False)
+        print(f"  [SAVED] Individual CSV segments -> {sub_epoch_dir}")
 
     return epochs_df
 
 
-def simulate_demo_raw_files(n_per_group: int = 3, fs: float = 512.0, n_trials_per_cond: int = 4):
+def simulate_demo_raw_files(n_per_group: int = 4, fs: float = 512.0, n_trials_per_cond: int = 5):
     """
-    DEMO MODE: Generates realistic synthetic PsychoPy *_events.csv files in ./data/logs/
-    AND matching raw Shimmer Consensys CSV files in ./data/raw_shimmer/ so you can test
-    the entire pipeline end-to-end (preprocess -> postprocess -> stats -> plot) right now!
+    DEMO MODE: Generates synthetic dual-channel Shimmer files matching the exact header & -1 timestamps
+    of sub-E41CB9_Shimmer_9BF9_Calibrated_SD.csv AND matching PsychoPy event logs.
     """
     rng = np.random.default_rng(2026)
-    base_unix_s = 1792490000.0  # Fixed starting Unix timestamp
-
-    print(f"\n[DEMO SIMULATOR] Generating {2 * n_per_group} synthetic participants (Shimmer + PsychoPy logs)...")
+    print(f"\n[DEMO SIMULATOR] Generating {2 * n_per_group} dual-channel participants (-1 timestamps, CH1 FDS + CH2 ECR)...")
 
     for g_idx, group in enumerate(["climber", "non_climber"]):
         for s in range(1, n_per_group + 1):
             sub_id = f"sub-DEMO{g_idx + 1}{s}"
             seed = 1000 + g_idx * 100 + s
-            t_cursor = base_unix_s + (g_idx * 10 + s) * 1000.0
-            psy_cursor = 0.0
-
+            rel_cursor = 0.0
             events = []
 
-            # 1. Calibration Sync Squeeze (1.5s) + 5s settle
-            t_Cursor_start = t_cursor
-            events.append({
-                "participant_id": sub_id, "expertise_group": group, "dominant_hand": "right",
-                "seed": seed, "trigger_mode": "none", "event_type": "sync_marker",
-                "trial_num": 0, "condition": "calibration", "stimulus_file": "fist_squeeze",
-                "onset_trigger_code": 1, "offset_trigger_code": 2,
-                "onset_unix_s": t_cursor, "onset_unix_ms": int(round(t_cursor * 1000)),
-                "offset_unix_s": t_cursor + 1.5, "offset_unix_ms": int(round((t_cursor + 1.5) * 1000)),
-                "onset_psychopy_s": psy_cursor, "offset_psychopy_s": psy_cursor + 1.5,
-                "target_duration_s": 1.5, "actual_duration_s": 1.5
-            })
-            t_cursor += 6.5
-            psy_cursor += 6.5
+            def add_ev(ev_type, t_num, cond, stim, dur):
+                nonlocal rel_cursor
+                events.append({
+                    "participant_id": sub_id, "expertise_group": group, "dominant_hand": "right",
+                    "shimmer_fs_configured_hz": fs, "seed": seed, "trigger_mode": "none",
+                    "event_type": ev_type, "trial_num": t_num, "condition": cond, "stimulus_file": stim,
+                    "rel_from_sync_onset_s": round(rel_cursor, 4),
+                    "rel_from_sync_offset_s": round(rel_cursor + dur, 4),
+                    "target_duration_s": dur, "actual_duration_s": dur,
+                    "onset_psychopy_s": round(rel_cursor + 5.0, 4),
+                    "offset_psychopy_s": round(rel_cursor + 5.0 + dur, 4),
+                    "onset_unix_ms": -1, "offset_unix_ms": -1,
+                    "onset_trigger_code": 0, "offset_trigger_code": 0
+                })
+                rel_cursor += dur
 
-            # 2. Resting Baseline (10s in demo for speed, or 30s)
-            base_dur = 10.0
-            events.append({
-                "participant_id": sub_id, "expertise_group": group, "dominant_hand": "right",
-                "seed": seed, "trigger_mode": "none", "event_type": "baseline",
-                "trial_num": 0, "condition": "resting_baseline", "stimulus_file": "fixation_cross",
-                "onset_trigger_code": 10, "offset_trigger_code": 11,
-                "onset_unix_s": t_cursor, "onset_unix_ms": int(round(t_cursor * 1000)),
-                "offset_unix_s": t_cursor + base_dur, "offset_unix_ms": int(round((t_cursor + base_dur) * 1000)),
-                "onset_psychopy_s": psy_cursor, "offset_psychopy_s": psy_cursor + base_dur,
-                "target_duration_s": base_dur, "actual_duration_s": base_dur
-            })
-            t_cursor += base_dur
-            psy_cursor += base_dur
+            # Continuous timeline locked to Start Squeeze (t = 0.0s)
+            add_ev("sync_start", 0, "calibration_start", "fist_squeeze_start", 1.5)
+            add_ev("post_sync_settle", 0, "muscle_settle", "relax_screen", 8.0)
+            add_ev("baseline", 0, "resting_baseline", "fixation_cross", 10.0)
 
-            # 3. Video Trials + Jittered ISIs
             cond_list = (["climbing"] * n_trials_per_cond) + (["everyday"] * n_trials_per_cond)
             rng.shuffle(cond_list)
-
             for idx, cond in enumerate(cond_list, start=1):
-                vid_dur = 5.0
-                isi_dur = round(float(rng.uniform(4.0, 7.0)), 3)
                 stim_name = f"{'crimp' if cond == 'climbing' else 'book'}_{idx:02d}.mp4"
+                add_ev("trial_video", idx, cond, stim_name, 4.0)
+                add_ev("isi", idx, f"post_{cond}_isi", "fixation_cross", round(float(rng.uniform(4.0, 7.0)), 3))
 
-                events.append({
-                    "participant_id": sub_id, "expertise_group": group, "dominant_hand": "right",
-                    "seed": seed, "trigger_mode": "none", "event_type": "trial_video",
-                    "trial_num": idx, "condition": cond, "stimulus_file": stim_name,
-                    "onset_trigger_code": 21 if cond == "climbing" else 22, "offset_trigger_code": 30,
-                    "onset_unix_s": t_cursor, "onset_unix_ms": int(round(t_cursor * 1000)),
-                    "offset_unix_s": t_cursor + vid_dur, "offset_unix_ms": int(round((t_cursor + vid_dur) * 1000)),
-                    "onset_psychopy_s": psy_cursor, "offset_psychopy_s": psy_cursor + vid_dur,
-                    "target_duration_s": vid_dur, "actual_duration_s": vid_dur
-                })
-                t_cursor += vid_dur
-                psy_cursor += vid_dur
+            add_ev("sync_end", len(cond_list) + 1, "calibration_end", "fist_squeeze_end", 1.5)
 
-                events.append({
-                    "participant_id": sub_id, "expertise_group": group, "dominant_hand": "right",
-                    "seed": seed, "trigger_mode": "none", "event_type": "isi",
-                    "trial_num": idx, "condition": f"post_{cond}_isi", "stimulus_file": "fixation_cross",
-                    "onset_trigger_code": 30, "offset_trigger_code": 31,
-                    "onset_unix_s": t_cursor, "onset_unix_ms": int(round(t_cursor * 1000)),
-                    "offset_unix_s": t_cursor + isi_dur, "offset_unix_ms": int(round((t_cursor + isi_dur) * 1000)),
-                    "onset_psychopy_s": psy_cursor, "offset_psychopy_s": psy_cursor + isi_dur,
-                    "target_duration_s": isi_dur, "actual_duration_s": isi_dur
-                })
-                t_cursor += isi_dur
-                psy_cursor += isi_dur
+            ev_path = config.LOG_DIR / f"{sub_id}_{group}_20261021_events.csv"
+            pd.DataFrame(events).to_csv(ev_path, index=False)
 
-            events_df = pd.DataFrame(events)
-            ev_path = config.LOG_DIR / f"{sub_id}_{group}_20261020_events.csv"
-            events_df.to_csv(ev_path, index=False)
-
-            # Generate continuous Shimmer recording spanning the entire session (+2s buffer on each end)
-            total_dur_s = (t_cursor - t_Cursor_start) + 4.0
+            # Simulate Shimmer recording starting 5.0s before the Start Squeeze
+            pre_buffer_s = 5.0
+            total_dur_s = pre_buffer_s + rel_cursor + 4.0
             n_samples = int(total_dur_s * fs)
-            t_vec_s = np.linspace(t_Cursor_start - 2.0, t_cursor + 2.0, n_samples, endpoint=False)
-            ts_unix_ms = t_vec_s * 1000.0
+            t_shimmer_s = np.arange(n_samples) / fs
+            t_rel_sync_s = t_shimmer_s - (pre_buffer_s + 0.25)  # +0.25s reaction time
 
-            # Base resting MUAP carrier (band-limited 30-350 Hz stochastic process) + 50Hz hum + 1Hz cable sway
-            resting_sd = 0.018  # 18 uV resting noise floor
-            envelope_profile = np.ones(n_samples) * resting_sd
+            env_ch1 = np.ones(n_samples) * 0.012 * np.linspace(1.0, 1.07, n_samples)  # FDS resting floor
+            env_ch2 = np.ones(n_samples) * 0.015 * np.linspace(1.0, 1.05, n_samples)  # ECR resting floor
 
-            # Add slow linear drift across session (+10% over session) to test ISI drift correction
-            slow_drift = np.linspace(1.0, 1.10, n_samples)
-            envelope_profile *= slow_drift
-
-            # Modulate envelope during each event
             for ev in events:
-                mask = (ts_unix_ms >= ev["onset_unix_ms"]) & (ts_unix_ms <= ev["offset_unix_ms"])
-                if ev["event_type"] == "sync_marker":
-                    envelope_profile[mask] *= 15.0  # Huge 15x fist squeeze spike
+                mask = (t_rel_sync_s >= ev["rel_from_sync_onset_s"]) & (t_rel_sync_s <= ev["rel_from_sync_offset_s"])
+                if ev["event_type"] in ("sync_start", "sync_end"):
+                    env_ch1[mask] *= 30.0  # ~0.36 mV burst like your test file!
+                    env_ch2[mask] *= 25.0
                 elif ev["event_type"] == "trial_video":
-                    # Realistic H1 interaction: Climbers resonate strongly to climbing (+45%),
-                    # while both groups show mild resonance to everyday grasping (+20%)
                     if ev["condition"] == "everyday":
-                        gain = rng.uniform(1.15, 1.30)
+                        gain_fds = rng.uniform(1.18, 1.32)
+                        gain_ecr = rng.uniform(1.15, 1.28)
                     else:
-                        gain = rng.uniform(1.35, 1.60) if group == "climber" else rng.uniform(0.98, 1.08)
+                        gain_fds = rng.uniform(1.42, 1.68) if group == "climber" else rng.uniform(0.98, 1.08)
+                        gain_ecr = rng.uniform(1.32, 1.55) if group == "climber" else rng.uniform(0.99, 1.08)
 
-                    # Smooth Gaussian burst peaking in the middle of the 5s clip
-                    t_local = (ts_unix_ms[mask] - ev["onset_unix_ms"]) / 1000.0
-                    burst = 1.0 + (gain - 1.0) * np.exp(-0.5 * ((t_local - 2.5) / 1.0) ** 2)
-                    envelope_profile[mask] *= burst
+                    t_loc = t_rel_sync_s[mask] - ev["rel_from_sync_onset_s"]
+                    burst = np.exp(-0.5 * ((t_loc - 2.0) / 0.85) ** 2)
+                    env_ch1[mask] *= (1.0 + (gain_fds - 1.0) * burst)
+                    env_ch2[mask] *= (1.0 + (gain_ecr - 1.0) * burst)
 
-            carrier = rng.normal(0.0, 1.0, size=n_samples)
-            hum_50hz = 0.010 * np.sin(2 * np.pi * 50.0 * t_vec_s)
-            motion_1hz = 0.015 * np.sin(2 * np.pi * 1.2 * t_vec_s)
-            raw_emg_mv = (envelope_profile * carrier) + hum_50hz + motion_1hz
+            hum = 0.006 * np.sin(2 * np.pi * 50.0 * t_shimmer_s)
+            sway = 0.010 * np.sin(2 * np.pi * 1.1 * t_shimmer_s)
+            ch1_mv = -19.141 + (env_ch1 * rng.normal(0, 1, n_samples)) + hum + sway
+            ch2_mv = -2.062 + (env_ch2 * rng.normal(0, 1, n_samples)) + hum + sway
 
-            # Write authentic Shimmer Consensys format (sep=\t + header + units row)
-            shimmer_path = config.RAW_SHIMMER_DIR / f"{sub_id}_Shimmer3_EMG_Session.csv"
+            shimmer_path = config.RAW_SHIMMER_DIR / f"{sub_id}_Shimmer_9BF9_Calibrated_SD.csv"
             with open(shimmer_path, "w", encoding="utf-8") as f:
-                f.write("sep=\t\n")
-                f.write("Shimmer_1_Timestamp_Unix_CAL\tShimmer_1_EMG_Ch1_CAL\n")
-                f.write("ms\tmV\n")
-                shimmer_out = pd.DataFrame({
-                    "ts": np.round(ts_unix_ms, 3),
-                    "emg": np.round(raw_emg_mv, 6)
+                f.write('"sep=\t"\n')
+                f.write(
+                    "Shimmer_9BF9_Timestamp_Unix_CAL\tShimmer_9BF9_Accel_LN_X_CAL\t"
+                    "Shimmer_9BF9_Accel_LN_Y_CAL\tShimmer_9BF9_Accel_LN_Z_CAL\t"
+                    "Shimmer_9BF9_ECG_EMG_Status1_CAL\tShimmer_9BF9_EMG_CH1_16BIT_CAL\t"
+                    "Shimmer_9BF9_EMG_CH2_16BIT_CAL\tShimmer_9BF9_Ext_Exp_A7_CAL\n"
+                )
+                f.write("ms\tm/(s^2)\tm/(s^2)\tm/(s^2)\tno_units\tmV\tmV\tmV\n")
+                out_df = pd.DataFrame({
+                    "ts": -1,
+                    "ax": -1.25, "ay": -4.40, "az": 8.90,
+                    "status": 128.0,
+                    "ch1": np.round(ch1_mv, 6),
+                    "ch2": np.round(ch2_mv, 6),
+                    "a7": 1150.0
                 })
-                shimmer_out.to_csv(f, sep="\t", index=False, header=False)
+                out_df.to_csv(f, sep="\t", index=False, header=False)
 
-            print(f"  -> Created Demo Files: {ev_path.name} & {shimmer_path.name}")
+            print(f"  -> Created: {ev_path.name} & {shimmer_path.name}")
 
 
-def match_and_preprocess_all(sync_method: str = "unix", export_csvs: bool = False):
+def match_and_preprocess_all(fs_override: float = None, export_csvs: bool = False):
     event_files = sorted(config.LOG_DIR.glob("*_events.csv"))
     if not event_files:
         print(f"[INFO] No '*_events.csv' files found in {config.LOG_DIR}")
@@ -407,54 +548,43 @@ def match_and_preprocess_all(sync_method: str = "unix", export_csvs: bool = Fals
     for ev_file in event_files:
         sub_id = ev_file.name.split("_")[0]
         matched_shimmer = [f for f in shimmer_files if sub_id.lower() in f.name.lower()]
-
         if not matched_shimmer:
-            print(
-                f"[SKIP] Found log '{ev_file.name}', but no matching Shimmer file containing "
-                f"'{sub_id}' in '{config.RAW_SHIMMER_DIR.name}/'."
-            )
+            print(f"[SKIP] Found log '{ev_file.name}', but no Shimmer file matching '{sub_id}' in {config.RAW_SHIMMER_DIR.name}/.")
             continue
 
         preprocess_participant(
             events_csv_path=ev_file,
             shimmer_file_path=matched_shimmer[0],
-            sync_method=sync_method,
+            fs_override=fs_override,
             export_individual_csvs=export_csvs
         )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preprocess & Slice Shimmer sEMG Recordings")
+    parser = argparse.ArgumentParser(description="Preprocess & Slice Dual-Channel (FDS + ECR) Shimmer sEMG Recordings")
     parser.add_argument("--events", type=str, default=None, help="Path to a specific PsychoPy *_events.csv file")
     parser.add_argument("--shimmer", type=str, default=None, help="Path to a specific raw Shimmer CSV file")
+    parser.add_argument("--fs", type=float, default=None, help="Override Shimmer sampling rate in Hz (default: 512.0)")
     parser.add_argument(
-        "--sync",
-        type=str,
-        choices=["unix", "sync_squeeze"],
-        default="unix",
-        help="Synchronization method: 'unix' (direct RTC match) or 'sync_squeeze' (auto-aligns on calibration squeeze peak)"
+        "--manual-t0",
+        type=float,
+        default=None,
+        help="Optional manual override for Start Squeeze t=0 time (in seconds from start of Shimmer file)"
     )
-    parser.add_argument(
-        "--export-csvs",
-        action="store_true",
-        help="Also export every single sliced epoch as its own standalone CSV file"
-    )
-    parser.add_argument(
-        "--simulate-demo",
-        action="store_true",
-        help="Generate synthetic Shimmer CSVs + PsychoPy logs and run preprocessing on them"
-    )
+    parser.add_argument("--export-csvs", action="store_true", help="Export each sliced epoch as an individual CSV")
+    parser.add_argument("--simulate-demo", action="store_true", help="Generate synthetic dual-channel Shimmer files and preprocess them")
     args = parser.parse_args()
 
     if args.simulate_demo:
-        simulate_demo_raw_files(n_per_group=4, fs=512.0, n_trials_per_cond=5)
-        match_and_preprocess_all(sync_method=args.sync, export_csvs=args.export_csvs)
+        simulate_demo_raw_files(n_per_group=4, fs=args.fs or 512.0, n_trials_per_cond=5)
+        match_and_preprocess_all(fs_override=args.fs, export_csvs=args.export_csvs)
     elif args.events and args.shimmer:
         preprocess_participant(
-            events_csv_path=Path(args.events),
-            shimmer_file_path=Path(args.shimmer),
-            sync_method=args.sync,
+            Path(args.events),
+            Path(args.shimmer),
+            fs_override=args.fs,
+            manual_t0_sec=args.manual_t0,
             export_individual_csvs=args.export_csvs
         )
     else:
-        match_and_preprocess_all(sync_method=args.sync, export_csvs=args.export_csvs)
+        match_and_preprocess_all(fs_override=args.fs, export_csvs=args.export_csvs)
