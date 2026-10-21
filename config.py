@@ -23,7 +23,7 @@ for d in [
     d.mkdir(parents=True, exist_ok=True)
 
 # --- EXPERIMENT TIMING PARAMETERS (in seconds) ---
-SYNC_COUNTDOWN_DURATION = 3.0  # Countdown before Start Squeeze
+SYNC_COUNTDOWN_DURATION = 5.0  # Countdown before Start Squeeze
 SYNC_SQUEEZE_DURATION = 1.5    # Duration of Start & End calibration squeezes (1.5s)
 POST_SYNC_SETTLE = 8.0         # Post-squeeze relaxation window before baseline
 BASELINE_DURATION = 10.0       # 10s resting baseline
