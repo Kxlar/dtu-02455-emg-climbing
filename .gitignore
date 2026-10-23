@@ -21,6 +21,10 @@ data/
 *.svg
 *.pdf
 
+# --- EXCEPTION: Keep the specific electrode placement diagrams ---
+!Electrodes_placement_on_FDS.jpg
+!Electrodes_placement_on_ECR.jpg
+
 # --- Video Stimuli & Backups ---
 stimuli/
 *.mp4
