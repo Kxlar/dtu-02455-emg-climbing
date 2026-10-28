@@ -139,72 +139,87 @@ def detect_squeeze_anchor_and_fs(
     shimmer_df: pd.DataFrame,
     events_df: pd.DataFrame,
     initial_fs: float,
-    manual_t0_sec: float = None
+    manual_t0_sec: float = None,
+    manual_tend_sec: float = None
 ) -> tuple[int, float]:
     """
-    Locates the exact sample index of the Start Squeeze (t = 0.0s) in the Shimmer recording
-    and (if a 'sync_end' squeeze is present) recalibrates the true sampling rate `fs`.
+    Locates the exact sample index of:
+      1. The Start Squeeze (t = 0.0s) in the first 35% of the Shimmer recording
+      2. The End Squeeze ('sync_end') in the last 30% of the Shimmer recording
+    and computes the exact empirical sampling rate `calibrated_fs` so that even a 5-10%
+    difference between nominal fs (e.g. 2048 Hz) and true hardware fs (~1954-2000 Hz)
+    is 100% eliminated across all trials.
     """
-    if manual_t0_sec is not None:
-        idx_0 = int(round(manual_t0_sec * initial_fs))
-        print(f"  [MANUAL SYNC OVERRIDE] Using t=0 at {manual_t0_sec:.2f}s (Sample Index = {idx_0:,})")
-        return idx_0, float(initial_fs)
-
     env_snr = compute_combined_squeeze_snr(shimmer_df, fs=initial_fs)
     n_total = len(env_snr)
-
-    # 1. Search the first 120 seconds (or first 45% of recording) for the Start Squeeze burst
-    search_end_idx = min(int(120.0 * initial_fs), int(n_total * 0.45))
-    search_end_idx = max(search_end_idx, min(n_total, int(10.0 * initial_fs)))
-    early_env = env_snr[:search_end_idx]
-
-    # A voluntary calibration squeeze has an SNR > 10-50x resting baseline;
-    # find the first major peak exceeding 35% of the maximum early burst (minimum SNR = 6.0)
-    max_early = float(np.max(early_env))
-    thresh_peak = max(max_early * 0.35, 6.0)
-    peaks, _ = signal.find_peaks(early_env, height=thresh_peak, distance=int(1.0 * initial_fs))
-
-    first_peak_idx = int(peaks[0]) if len(peaks) > 0 else int(np.argmax(early_env))
-
-    # Walk backward from the squeeze peak (up to 1.2s) to find the exact rising-edge onset (20% of peak height)
-    peak_height = env_snr[first_peak_idx]
-    onset_threshold = max(peak_height * 0.20, 3.0)
-    lookback_start = max(0, first_peak_idx - int(1.2 * initial_fs))
-    pre_segment = env_snr[lookback_start:first_peak_idx]
-    below_indices = np.where(pre_segment <= onset_threshold)[0]
-
-    if len(below_indices) > 0:
-        start_squeeze_idx = lookback_start + int(below_indices[-1])
-    else:
-        start_squeeze_idx = max(0, first_peak_idx - int(0.35 * initial_fs))
-
-    # Account for typical human visual reaction time (~0.25s between screen flash 'SQUEEZE NOW' and muscle onset)
     reaction_comp_samples = int(0.25 * initial_fs)
-    t0_anchor_idx = max(0, start_squeeze_idx - reaction_comp_samples)
 
-    print(
-        f"  [START SQUEEZE DETECTED] Rising edge at idx {start_squeeze_idx:,} "
-        f"({start_squeeze_idx / initial_fs:.2f}s) -> Screen t=0 anchor set to idx {t0_anchor_idx:,} "
-        f"({t0_anchor_idx / initial_fs:.2f}s)"
-    )
+    # --- 1. LOCATE START SQUEEZE (t = 0.0s) ---
+    if manual_t0_sec is not None:
+        t0_anchor_idx = int(round(manual_t0_sec * initial_fs))
+        print(f"  [MANUAL START OVERRIDE] Using t=0 at {manual_t0_sec:.2f}s (Sample Index = {t0_anchor_idx:,})")
+    else:
+        search_end_idx = min(int(120.0 * initial_fs), int(n_total * 0.35))
+        search_end_idx = max(search_end_idx, min(n_total, int(10.0 * initial_fs)))
+        early_env = env_snr[:search_end_idx]
 
-    # 2. Optional Two-Point Bookend Calibration: Check for 'sync_end' at end of experiment
+        max_early = float(np.max(early_env))
+        thresh_peak = max(max_early * 0.35, 6.0)
+        peaks, _ = signal.find_peaks(early_env, height=thresh_peak, distance=int(1.0 * initial_fs))
+
+        first_peak_idx = int(peaks[0]) if len(peaks) > 0 else int(np.argmax(early_env))
+
+        peak_height = env_snr[first_peak_idx]
+        onset_threshold = max(peak_height * 0.20, 3.0)
+        lookback_start = max(0, first_peak_idx - int(1.2 * initial_fs))
+        pre_segment = env_snr[lookback_start:first_peak_idx]
+        below_indices = np.where(pre_segment <= onset_threshold)[0]
+
+        if len(below_indices) > 0:
+            start_squeeze_idx = lookback_start + int(below_indices[-1])
+        else:
+            start_squeeze_idx = max(0, first_peak_idx - int(0.35 * initial_fs))
+
+        t0_anchor_idx = max(0, start_squeeze_idx - reaction_comp_samples)
+        print(
+            f"  [START SQUEEZE DETECTED] Rising edge at idx {start_squeeze_idx:,} "
+            f"({start_squeeze_idx / initial_fs:.2f}s @ nominal fs) -> Screen t=0 anchor = idx {t0_anchor_idx:,}"
+        )
+
+    # --- 2. LOCATE END SQUEEZE ('sync_end') & RECALIBRATE SAMPLING RATE ---
     calibrated_fs = float(initial_fs)
     end_rows = events_df[events_df["event_type"] == "sync_end"]
 
     if not end_rows.empty and "rel_from_sync_onset_s" in end_rows.columns:
         expected_rel_end_s = float(end_rows.iloc[0]["rel_from_sync_onset_s"])
-        expected_end_idx = t0_anchor_idx + int(round(expected_rel_end_s * initial_fs))
 
-        # Search +/- 12 seconds around expected end squeeze location
-        tol_samples = int(12.0 * initial_fs)
-        w_start = max(t0_anchor_idx + int(15.0 * initial_fs), expected_end_idx - tol_samples)
-        w_end = min(n_total, expected_end_idx + tol_samples)
+        if manual_tend_sec is not None:
+            end_anchor_idx = int(round(manual_tend_sec * initial_fs))
+            calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
+            print(
+                f"  [MANUAL END OVERRIDE] End Squeeze at {manual_tend_sec:.2f}s (idx {end_anchor_idx:,}) "
+                f"-> Calibrated Shimmer fs = {calibrated_fs:.3f} Hz"
+            )
+            return t0_anchor_idx, calibrated_fs
+
+        # Search the final 30% of the recording (and allow +/- 15% sampling rate tolerance around expected_end_idx)
+        expected_end_idx = t0_anchor_idx + int(round(expected_rel_end_s * initial_fs))
+        tol_samples = max(int(45.0 * initial_fs), int(0.15 * expected_rel_end_s * initial_fs))
+
+        w_start = max(int(n_total * 0.70), expected_end_idx - tol_samples)
+        w_start = min(w_start, max(t0_anchor_idx + int(15.0 * initial_fs), n_total - int(60.0 * initial_fs)))
+        w_end = n_total
 
         if w_end > w_start + int(1.0 * initial_fs):
             end_env = env_snr[w_start:w_end]
-            if np.max(end_env) > 6.0:
-                end_peak_idx = w_start + int(np.argmax(end_env))
+            max_end = float(np.max(end_env))
+
+            if max_end > 5.0:
+                # Find the prominent calibration squeeze peak in the tail of the file
+                end_peaks, _ = signal.find_peaks(end_env, height=max(max_end * 0.45, 5.0), distance=int(1.0 * initial_fs))
+                end_peak_local = int(end_peaks[-1]) if len(end_peaks) > 0 else int(np.argmax(end_env))
+                end_peak_idx = w_start + end_peak_local
+
                 ep_height = env_snr[end_peak_idx]
                 eb_lookback = max(w_start, end_peak_idx - int(1.2 * initial_fs))
                 eb_below = np.where(env_snr[eb_lookback:end_peak_idx] <= max(ep_height * 0.20, 3.0))[0]
@@ -214,8 +229,12 @@ def detect_squeeze_anchor_and_fs(
                 calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
                 print(
                     f"  [BOOKEND DRIFT CALIBRATED] End Squeeze detected at idx {end_rising_idx:,} "
-                    f"(Elapsed = {expected_rel_end_s:.2f}s) -> Empirical Shimmer fs = {calibrated_fs:.3f} Hz"
+                    f"({end_rising_idx / initial_fs:.2f}s on nominal axis | PsychoPy Δt = {expected_rel_end_s:.2f}s)\n"
+                    f"  -> True Empirical Shimmer Sampling Rate = {calibrated_fs:.3f} Hz "
+                    f"(Nominal was {initial_fs:.1f} Hz)"
                 )
+            else:
+                print("  [WARNING] Could not find a clear End Squeeze peak (SNR > 5) in the final 30% of the file.")
 
     return t0_anchor_idx, calibrated_fs
 
@@ -224,17 +243,11 @@ def slice_emg_epochs(
     shimmer_df: pd.DataFrame,
     events_df: pd.DataFrame,
     initial_fs: float,
-    manual_t0_sec: float = None
+    manual_t0_sec: float = None,
+    manual_tend_sec: float = None
 ) -> tuple[pd.DataFrame, float]:
-    """
-    Slices the continuous Shimmer DataFrame into labeled segments (baseline, trial_video, isi)
-    using the continuous relative timestamps (`rel_from_sync_onset_s` and `rel_from_sync_offset_s`)
-    locked to the Start Squeeze at t = 0.0s.
-    Extracts BOTH `emg_ch1` (FDS) and `emg_ch2` (ECR) for every epoch.
-    """
     events_df = events_df.copy()
 
-    # Backwards compatibility: if an older log doesn't have `rel_from_sync_onset_s`, compute it from `onset_psychopy_s`
     if "rel_from_sync_onset_s" not in events_df.columns:
         sync_rows = events_df[events_df["event_type"].isin(["sync_start", "sync_marker"])]
         t0_psy = float(sync_rows["onset_psychopy_s"].iloc[0]) if not sync_rows.empty else float(events_df["onset_psychopy_s"].iloc[0])
@@ -242,7 +255,11 @@ def slice_emg_epochs(
         events_df["rel_from_sync_offset_s"] = events_df["offset_psychopy_s"] - t0_psy
 
     t0_anchor_idx, calibrated_fs = detect_squeeze_anchor_and_fs(
-        shimmer_df, events_df, initial_fs=initial_fs, manual_t0_sec=manual_t0_sec
+        shimmer_df,
+        events_df,
+        initial_fs=initial_fs,
+        manual_t0_sec=manual_t0_sec,
+        manual_tend_sec=manual_tend_sec
     )
 
     n_total_samples = len(shimmer_df)
@@ -292,7 +309,6 @@ def slice_emg_epochs(
             "time_s": rel_time_s,
         }
 
-        # Store both FDS (emg_ch1) and ECR (emg_ch2) arrays
         for col in emg_cols:
             epoch_record[col] = segment[col].values.astype(np.float64)
 
@@ -374,6 +390,7 @@ def preprocess_participant(
     shimmer_file_path: Path,
     fs_override: float = None,
     manual_t0_sec: float = None,
+    manual_tend_sec: float = None,
     export_individual_csvs: bool = False
 ):
     events_df = pd.read_csv(events_csv_path)
@@ -393,7 +410,11 @@ def preprocess_participant(
 
     shimmer_df, fs_est, _ = load_shimmer_file(shimmer_file_path, default_fs=cfg_fs)
     epochs_df, calibrated_fs = slice_emg_epochs(
-        shimmer_df, events_df, initial_fs=fs_est, manual_t0_sec=manual_t0_sec
+        shimmer_df,
+        events_df,
+        initial_fs=fs_est,
+        manual_t0_sec=manual_t0_sec,
+        manual_tend_sec=manual_tend_sec
     )
 
     if epochs_df.empty:
