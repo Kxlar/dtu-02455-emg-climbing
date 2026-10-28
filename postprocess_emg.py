@@ -17,28 +17,24 @@ def apply_clancy_cascade(
 ) -> dict:
     """
     Implements the sequential sEMG amplitude estimation cascade (Clancy et al., 2002;
-    Cifrek et al., 2009 Fig. 3; Protocol Section 5):
-      Stage 0: Remove static half-cell DC offset (e.g., -19.1 mV on CH1, -2.1 mV on CH2)
-      Stage 1: Noise Reject Filter -> 20-500 Hz Butterworth Bandpass + 50 Hz Notch
-               (Note: At fs=512 Hz, Nyquist is 256 Hz, so upper cutoff safely clamps to 0.95 * Nyq = 243.2 Hz)
-      Stage 2: Demodulate / Detect -> Full-wave rectification |x|^d (d=1 for MAV, d=2 for RMS)
-      Stage 3: Smooth              -> Low-pass Butterworth filter at 8 Hz (Linear Envelope)
-      Stage 4: Relinearize         -> Raise smoothed signal to (.)^(1/d)
+    Cifrek et al., 2009 Fig. 3; Protocol Section 5) with:
+      - Automatic dominant mains-hum peak tracking (45-55 Hz) to handle empirical fs calibration (e.g. 1943 Hz vs 2048 Hz)
+      - Low-ringing Butterworth bandstop + damped Q=12 notch so edge transients decay in < 0.15s
+      - Edge-transient tapering on the first/last 0.25s so filter boundary ringing never masquerades as a physiological peak
     """
     x = np.asarray(raw_emg, dtype=np.float64)
     if len(x) < 12:
         zeros = np.zeros_like(x)
         return {"bandpassed": zeros, "notched": zeros, "rectified": zeros, "envelope": zeros}
 
-    # Stage 0: Center around 0 mV before filtering to prevent edge transients
-    x = x - np.mean(x)
+    # Stage 0: Remove linear trend & static DC offset (-19.1 mV / -2.1 mV) to prevent boundary steps
+    x = signal.detrend(x, type="linear")
 
     nyq = 0.5 * fs
     bp_low = config.BANDPASS_LOW
     bp_high = min(config.BANDPASS_HIGH, nyq * 0.95)
 
-    # Reflective padding length to eliminate filter ringing at t=0.0s and t=4.0s
-    padlen = min(int(1.0 * fs), (len(x) // 3) - 1)
+    padlen = min(int(0.5 * fs), (len(x) // 3) - 1)
     padlen = max(padlen, 0)
 
     # --- STAGE 1A: Bandpass Filter (20 Hz to min(500 Hz, 0.95*Nyquist)) ---
@@ -51,15 +47,47 @@ def apply_clancy_cascade(
     )
     x_bp = signal.sosfiltfilt(sos_bp, x, padlen=padlen)
 
-    # --- STAGE 1B: 50 Hz Power-Line Notch Filter (+ harmonics below bp_high) ---
+    # --- STAGE 1B: Adaptive Power-Line Hum Rejection (Handles 47-52 Hz apparent mains hum + harmonics) ---
     x_notched = x_bp.copy()
-    notch_freqs = [config.NOTCH_FREQ]
-    if apply_harmonic_notches:
-        notch_freqs = [f for f in (50.0, 100.0, 150.0, 200.0, 250.0, 350.0, 450.0) if f < bp_high]
 
-    for f0 in notch_freqs:
-        b_notch, a_notch = signal.iirnotch(w0=f0, Q=config.NOTCH_Q, fs=fs)
-        x_notched = signal.filtfilt(b_notch, a_notch, x_notched, padlen=padlen)
+    # 1. Find the exact empirical power-line fundamental frequency in [45, 55] Hz via FFT
+    freqs = np.fft.rfftfreq(len(x_notched), d=1.0 / fs)
+    fft_mag = np.abs(np.fft.rfft(x_notched))
+    mains_mask = (freqs >= 45.0) & (freqs <= 55.0)
+    if np.any(mains_mask):
+        f_mains = float(freqs[mains_mask][np.argmax(fft_mag[mains_mask])])
+    else:
+        f_mains = config.NOTCH_FREQ
+
+    # 2. Apply a fast-settling 2nd-order Butterworth bandstop around [f_mains - 2.0, f_mains + 2.0] Hz
+    #    (eliminates long 0.4s Q=30 ringing horns at t=0.0s, t=4.0s, and SD-card packet drops!)
+    bs_low = max(22.0, min(f_mains, 50.0) - 2.5)
+    bs_high = min(bp_high - 5.0, max(f_mains, 50.0) + 2.5)
+    if bs_high > bs_low:
+        sos_bs = signal.butter(N=2, Wn=[bs_low, bs_high], btype="bandstop", fs=fs, output="sos")
+        x_notched = signal.sosfiltfilt(sos_bs, x_notched, padlen=padlen)
+
+    # 3. Notch out both the empirical fundamental `f_mains` and nominal 50 Hz + odd/even harmonics with damped Q=12
+    base_notches = [f_mains, config.NOTCH_FREQ]
+    if apply_harmonic_notches:
+        for mult in (2, 3, 4, 5, 7, 9):
+            base_notches.extend([f_mains * mult, config.NOTCH_FREQ * mult])
+
+    for f0 in sorted(set(np.round(base_notches, 2))):
+        if 25.0 < f0 < bp_high:
+            b_notch, a_notch = signal.iirnotch(w0=f0, Q=12.0, fs=fs)
+            x_notched = signal.filtfilt(b_notch, a_notch, x_notched, padlen=padlen)
+
+    # Suppress any residual <0.20s boundary reflection transients at t=0.0s and t=4.0s
+    edge_samples = min(int(0.20 * fs), len(x_notched) // 10)
+    if edge_samples > 4:
+        interior_rms = np.sqrt(np.mean(x_notched[edge_samples:-edge_samples] ** 2))
+        taper = np.ones(len(x_notched), dtype=np.float64)
+        ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(edge_samples) / edge_samples))
+        taper[:edge_samples] = ramp
+        taper[-edge_samples:] = ramp[::-1]
+        # Blend edges smoothly toward interior RMS floor so edge reflection never creates false peaks
+        x_notched = x_notched * taper + (x_notched * (1.0 - taper) * min(1.0, interior_rms / (np.max(np.abs(x_notched)) + 1e-12)))
 
     # --- STAGE 2: Detect / Full-Wave Rectification (|x|^d) ---
     if demod_power == 1:
@@ -144,7 +172,8 @@ def extract_trial_features(
     time_s: np.ndarray,
     trial_envelope: np.ndarray,
     base_stats: dict,
-    local_isi_floor: float = None
+    local_isi_floor: float = None,
+    edge_guard_s: float = 0.25
 ) -> dict:
     """
     Extracts Peak Amplitude and Area Under the Curve (AUC) for a single trial and channel,
@@ -153,21 +182,44 @@ def extract_trial_features(
       2. Ratio vs. 30s Resting Baseline (1.0 = Resting Baseline, Protocol Section 3.5)
       3. Z-Score SNR vs. 30s Resting Baseline ((E(t) - mu_base) / sigma_base)
       4. Local Pre-Trial ISI Drift-Corrected % Variation (using the last 2.0s of ISI_{k-1})
-    """
-    duration_s = float(time_s[-1] - time_s[0]) if len(time_s) > 1 else 4.0
 
-    # 1. Raw Envelope Features
-    raw_peak = float(np.max(trial_envelope))
-    raw_mean = float(np.mean(trial_envelope))
-    raw_auc = float(trapezoid(y=trial_envelope, x=time_s))
-    raw_auc_per_sec = raw_auc / duration_s if duration_s > 0 else raw_mean
+    Note on `edge_guard_s` (default 0.25s):
+      Evaluates Peak Amplitude and mean envelope on the interior window [0.25s .. T-0.25s]
+      so that any zero-phase IIR filter reflection transients at t=0.0s or t=4.0s never
+      artificially inflate Peak Amplitude or AUC.
+    """
+    total_duration_s = float(time_s[-1] - time_s[0]) if len(time_s) > 1 else 4.0
+
+    # Isolate clean interior window [edge_guard_s .. end - edge_guard_s]
+    if len(time_s) > 20 and total_duration_s > 2.5 * edge_guard_s:
+        t0 = float(time_s[0]) + edge_guard_s
+        t1 = float(time_s[-1]) - edge_guard_s
+        inner_mask = (time_s >= t0) & (time_s <= t1)
+        if np.sum(inner_mask) >= 10:
+            t_eval = time_s[inner_mask]
+            env_eval = trial_envelope[inner_mask]
+        else:
+            t_eval = time_s
+            env_eval = trial_envelope
+    else:
+        t_eval = time_s
+        env_eval = trial_envelope
+
+    eval_duration_s = float(t_eval[-1] - t_eval[0]) if len(t_eval) > 1 else total_duration_s
+
+    # 1. Raw Envelope Features (Peak from clean interior; AUC scaled to full trial duration)
+    raw_peak = float(np.max(env_eval))
+    raw_mean = float(np.mean(env_eval))
+    eval_auc = float(trapezoid(y=env_eval, x=t_eval))
+    raw_auc_per_sec = eval_auc / eval_duration_s if eval_duration_s > 0 else raw_mean
+    raw_auc = raw_auc_per_sec * total_duration_s
 
     mu_base = base_stats["base_trimmed_mean"]
     mu_base_raw = base_stats["base_mean"]
     sigma_base = base_stats["base_robust_sd"]
 
-    expected_base_auc = mu_base * duration_s
-    expected_base_auc_raw = mu_base_raw * duration_s
+    expected_base_auc = mu_base * total_duration_s
+    expected_base_auc_raw = mu_base_raw * total_duration_s
 
     # 2. Protocol % Variation & Ratio against 30s Baseline
     peak_pct_change = ((raw_peak - mu_base) / mu_base) * 100.0
@@ -180,14 +232,15 @@ def extract_trial_features(
     auc_pct_change_untrimmed = ((raw_auc - expected_base_auc_raw) / expected_base_auc_raw) * 100.0
 
     # 3. Z-Score SNR Normalization
-    z_env = (trial_envelope - mu_base) / sigma_base
-    peak_zscore = float(np.max(z_env))
-    mean_zscore = float(np.mean(z_env))
-    auc_zscore = float(trapezoid(y=z_env, x=time_s))
+    z_env_eval = (env_eval - mu_base) / sigma_base
+    peak_zscore = float(np.max(z_env_eval))
+    mean_zscore = float(np.mean(z_env_eval))
+    auc_zscore_eval = float(trapezoid(y=z_env_eval, x=t_eval))
+    auc_zscore = (auc_zscore_eval / eval_duration_s) * total_duration_s if eval_duration_s > 0 else mean_zscore * total_duration_s
 
     # 4. Local Pre-Trial ISI Drift-Corrected Normalization
     if local_isi_floor is not None and local_isi_floor > 0:
-        local_expected_auc = local_isi_floor * duration_s
+        local_expected_auc = local_isi_floor * total_duration_s
         peak_pct_local_isi = ((raw_peak - local_isi_floor) / local_isi_floor) * 100.0
         auc_pct_local_isi = ((raw_auc - local_expected_auc) / local_expected_auc) * 100.0
     else:
@@ -195,7 +248,7 @@ def extract_trial_features(
         auc_pct_local_isi = auc_pct_change
 
     return {
-        "duration_s": round(duration_s, 4),
+        "duration_s": round(total_duration_s, 4),
         "raw_peak_mv": raw_peak,
         "raw_mean_mv": raw_mean,
         "raw_auc_mv_s": raw_auc,
