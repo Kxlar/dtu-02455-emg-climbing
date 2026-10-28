@@ -377,19 +377,22 @@ def postprocess_participant(epoch_pkl_path: Path, demod_power: int = 1, save_qc_
             f"Robust SD = {base_stats['base_robust_sd']:.6f} mV"
         )
 
-        # 2. Pre-compute settled ISI resting floors (last 2.0s of each ISI) for this muscle channel
+        # 2. Compute artifact-free local resting floors from EVERY ISI for this muscle channel
+        #    Uses the quietest 10th-60th percentile of 400ms sub-windows in each ISI (ignoring any swallows/twitches)
         isi_floors = {}
-        isi_rows = epochs_df[epochs_df["event_type"] == "isi"]
+        isi_sd_floors = {}
+        isi_rows = epochs_df[epochs_df["event_type"] == "isi"].sort_values("trial_num")
         for _, isi_row in isi_rows.iterrows():
             t_num = int(isi_row["trial_num"])
             isi_env = apply_clancy_cascade(isi_row[col_name], fs=fs, demod_power=demod_power)["envelope"]
-            tail_samples = min(int(2.0 * fs), len(isi_env))
-            if tail_samples > 0:
-                isi_floors[t_num] = float(np.median(isi_env[-tail_samples:]))
+            isi_stats = compute_robust_baseline_stats(isi_env, fs=fs)
+            isi_floors[t_num] = isi_stats["base_trimmed_mean"]
+            isi_sd_floors[t_num] = isi_stats["base_robust_sd"]
 
-        # 3. Process all Video Observation Trials for this muscle channel
+        # 3. Process all Video Observation Trials with Rolling Local ISI Baseline Drift Correction
         trial_rows = epochs_df[epochs_df["event_type"] == "trial_video"].sort_values("trial_num")
         sample_climb_trial_for_qc = None
+        sample_climb_base_stats_for_qc = base_stats
 
         for _, row in trial_rows.iterrows():
             t_num = int(row["trial_num"])
@@ -399,12 +402,36 @@ def postprocess_participant(epoch_pkl_path: Path, demod_power: int = 1, save_qc_
             t_vec = row["time_s"]
 
             casc = apply_clancy_cascade(raw_sig, fs=fs, demod_power=demod_power)
-            local_floor = isi_floors.get(t_num - 1, base_stats["base_trimmed_mean"])
+
+            # Gather nearby ISI resting floors (pre-ISI k-1 and post-ISI k) to track any slow electrode drift
+            nearby_isis = [isi_floors[k] for k in (t_num - 2, t_num - 1, t_num) if k in isi_floors]
+            nearby_sds = [isi_sd_floors[k] for k in (t_num - 2, t_num - 1, t_num) if k in isi_sd_floors]
+
+            if nearby_isis:
+                # Take the minimum/median quiet resting floor in the immediate neighborhood of trial `t_num`
+                local_floor = float(np.median(nearby_isis))
+                local_sd = float(np.median(nearby_sds))
+            else:
+                local_floor = base_stats["base_trimmed_mean"]
+                local_sd = base_stats["base_robust_sd"]
+
+            # Build drift-corrected baseline stats for this trial:
+            # If the initial 30s baseline was contaminated or drifted by >15% relative to the local resting ISI floor,
+            # anchor to the local quiet ISI floor so slow macro-drift never pushes trials artificially below baseline!
+            drift_ratio = abs(local_floor - base_stats["base_trimmed_mean"]) / max(base_stats["base_trimmed_mean"], 1e-12)
+            if drift_ratio > 0.15:
+                effective_base_stats = {
+                    **base_stats,
+                    "base_trimmed_mean": local_floor,
+                    "base_robust_sd": local_sd
+                }
+            else:
+                effective_base_stats = base_stats
 
             feats = extract_trial_features(
                 time_s=t_vec,
                 trial_envelope=casc["envelope"],
-                base_stats=base_stats,
+                base_stats=effective_base_stats,
                 local_isi_floor=local_floor
             )
 
@@ -436,9 +463,14 @@ def postprocess_participant(epoch_pkl_path: Path, demod_power: int = 1, save_qc_
 
             if sample_climb_trial_for_qc is None and cond == "climbing":
                 sample_climb_trial_for_qc = wave_rec
+                sample_climb_base_stats_for_qc = effective_base_stats
 
         if save_qc_plot and sample_climb_trial_for_qc is not None:
-            generate_qc_cascade_plot(sub_id, group, muscle_code, sample_climb_trial_for_qc, base_stats)
+            generate_qc_cascade_plot(
+                sub_id, group, muscle_code,
+                sample_climb_trial_for_qc,
+                sample_climb_base_stats_for_qc
+            )
 
     features_df = pd.DataFrame(trial_features_list)
 
@@ -465,10 +497,58 @@ def postprocess_participant(epoch_pkl_path: Path, demod_power: int = 1, save_qc_
     return features_df
 
 
+def reject_outlier_trials_df(
+    df: pd.DataFrame,
+    mad_thresh: float = 5.0,
+    min_physio_peak_pct: float = 200.0
+) -> pd.DataFrame:
+    """
+    Conservative artifact rejection within each (participant_id, muscle, condition) cell.
+    A trial is ONLY rejected as a gross movement/impedance artifact if:
+      1. Its AUC deviates from the cell median by more than `mad_thresh * MAD` (default 5.0 MAD), AND
+      2. Its Peak Amplitude exceeds `min_physio_peak_pct` (default +200% above resting baseline)
+         OR its AUC is catastrophically negative (< -50%, indicating an electrode drop-out).
+    This prevents genuine subliminal motor resonance bursts (+15% to +150%) from being clipped!
+    """
+    if mad_thresh <= 0:
+        print("  [ARTIFACT REJECTION DISABLED] Keeping 100% of trials.")
+        return df
+
+    keep_indices = []
+
+    for (p_id, m_cd, c_nd), grp in df.groupby(["participant_id", "muscle", "condition"], sort=False):
+        if len(grp) < 5:
+            keep_indices.extend(grp.index.tolist())
+            continue
+
+        auc_vals = grp["norm_auc_pct"].values
+        peak_vals = grp["norm_peak_pct"].values
+
+        med = np.median(auc_vals)
+        mad = max(np.median(np.abs(auc_vals - med)) * 1.4826, 2.5)
+
+        is_stat_outlier = np.abs(auc_vals - med) > (mad_thresh * mad)
+        is_gross_artifact = (peak_vals > min_physio_peak_pct) | (auc_vals < -50.0)
+
+        drop_mask = is_stat_outlier & is_gross_artifact
+        keep_mask = ~drop_mask
+
+        n_dropped = int(np.sum(drop_mask))
+        if n_dropped > 0:
+            dropped_trials = grp.loc[drop_mask, "trial_num"].tolist()
+            print(
+                f"  [ARTIFACT REJECTION] {p_id} | {m_cd} | {c_nd:<10}: "
+                f"Dropped {n_dropped} gross artifact trial(s) {dropped_trials}"
+            )
+        keep_indices.extend(grp.index[keep_mask].tolist())
+
+    return df.loc[sorted(keep_indices)].reset_index(drop=True)
+
+
 def run_batch_postprocessing(demod_power: int = 1):
     """
     Processes all *_epochs.pkl files in ./data/epochs/ and builds the two master tables:
-      1. master_trial_level_features.csv (all trials x 2 muscles per participant)
+      1. master_trial_level_features.csv (cleaned trials x 2 muscles per participant)
       2. master_subject_level_anova_table.csv (subject condition means per muscle for 2x2 ANOVA)
     """
     epoch_files = sorted(config.EPOCHS_DIR.glob("*_epochs.pkl"))
@@ -482,8 +562,14 @@ def run_batch_postprocessing(demod_power: int = 1):
         all_participants_dfs.append(df_sub)
 
     master_trials_df = pd.concat(all_participants_dfs, ignore_index=True)
+
+    print(f"\n------------------------------------------------------------")
+    print("Running MAD Artifact Rejection on Trial-Level Features...")
+    print(f"------------------------------------------------------------")
+    clean_trials_df = reject_outlier_trials_df(master_trials_df, mad_thresh=3.5)
+
     master_trials_path = config.PROCESSED_DIR / "master_trial_level_features.csv"
-    master_trials_df.to_csv(master_trials_path, index=False)
+    clean_trials_df.to_csv(master_trials_path, index=False)
 
     dv_cols = [
         "raw_peak_mv", "raw_auc_mv_s", "raw_auc_per_sec_mv",
@@ -493,8 +579,9 @@ def run_batch_postprocessing(demod_power: int = 1):
         "zscore_peak", "zscore_mean", "zscore_auc",
         "local_isi_norm_peak_pct", "local_isi_norm_auc_pct"
     ]
+
     subject_means_df = (
-        master_trials_df
+        clean_trials_df
         .groupby(
             ["participant_id", "expertise_group", "dominant_hand", "channel", "muscle", "condition"],
             as_index=False
@@ -503,6 +590,14 @@ def run_batch_postprocessing(demod_power: int = 1):
     )
     subject_means_path = config.PROCESSED_DIR / "master_subject_level_anova_table.csv"
     subject_means_df.to_csv(subject_means_path, index=False)
+
+    print("\n  [CLEANED SUBJECT-LEVEL CONDITION AVERAGES (AFTER ARTIFACT REJECTION)]")
+    for _, row in subject_means_df.iterrows():
+        print(
+            f"    {row['participant_id']} ({row['expertise_group']:<11}) | {row['muscle']} | {row['condition']:<10} -> "
+            f"Peak: {row['norm_peak_pct']:+6.2f}% | AUC: {row['norm_auc_pct']:+6.2f}% | "
+            f"Z-AUC: {row['zscore_auc']:+5.2f} | ISI-AUC: {row['local_isi_norm_auc_pct']:+6.2f}%"
+        )
 
     print(f"\n============================================================")
     print(f"[BATCH DUAL-CHANNEL POST-PROCESSING COMPLETE]")

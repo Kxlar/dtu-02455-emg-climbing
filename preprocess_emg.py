@@ -108,30 +108,71 @@ def load_shimmer_file(filepath: Path, default_fs: float = config.DEFAULT_SAMPLIN
 
 def compute_combined_squeeze_snr(shimmer_df: pd.DataFrame, fs: float) -> np.ndarray:
     """
-    Computes a combined Signal-to-Noise Ratio (SNR) burst envelope across CH1 (FDS) and CH2 (ECR)
-    to reliably locate the high-amplitude calibration fist squeezes (t=0 Start Squeeze & End Squeeze).
-    Steps:
-      1. 20 Hz High-Pass Butterworth filter (removes the -19 mV / -2 mV DC offsets & drift)
-      2. 200 ms Moving RMS window
-      3. Robust Z-score against the recording's median resting noise floor (MAD)
+    Computes an instantaneous, macro-detrended Micro-Burst SNR envelope across CH1 (FDS)
+    and CH2 (ECR) that isolates sharp 1.5s voluntary fist squeezes while completely rejecting:
+      1. Slow macro-baseline wandering (via 1st-difference + 60 Hz high-pass)
+      2. 50 Hz power-line hum swells (via 50/100/150/200 Hz notches + >60 Hz passband)
+      3. Multi-second impedance shifts at the start of recording (by subtracting a 6.0s
+         sliding local median floor from a 0.25s fast RMS envelope!)
     """
-    sos_hp = signal.butter(4, 20.0, btype="highpass", fs=fs, output="sos")
-    win_samples = max(int(0.20 * fs), 10)
-    kernel = np.ones(win_samples) / win_samples
+    from scipy.ndimage import median_filter
+
+    nyq = 0.5 * fs
+    # Isolate high-frequency EMG motor unit action potentials ABOVE 50 Hz mains hum (60 Hz to 0.90*Nyq)
+    hp_cut = min(60.0, nyq * 0.45)
+    lp_cut = min(230.0, nyq * 0.92)
+    sos_bp = signal.butter(4, [hp_cut, lp_cut], btype="bandpass", fs=fs, output="sos")
+
+    fast_win = max(int(0.25 * fs), 9)
+    fast_kernel = np.ones(fast_win) / fast_win
+
+    # Downsample factor for fast 6.0-second local background median estimation
+    ds_factor = max(int(0.05 * fs), 1)
+    slow_win_ds = max(int(6.0 / 0.05), 15)  # 6.0s window in 50ms steps
 
     combined_snr = np.zeros(len(shimmer_df), dtype=np.float64)
     n_chs = 0
 
     for col in ["emg_ch1", "emg_ch2"]:
-        if col in shimmer_df.columns:
-            raw = shimmer_df[col].values.astype(np.float64)
-            hp = signal.sosfiltfilt(sos_hp, raw - np.mean(raw))
-            rms = np.sqrt(np.convolve(hp**2, kernel, mode="same"))
-            med = np.median(rms)
-            robust_sd = max(np.median(np.abs(rms - med)) * 1.4826, 1e-6)
-            combined_snr += (rms - med) / robust_sd
-            n_chs += 1
+        if col not in shimmer_df.columns:
+            continue
 
+        raw = shimmer_df[col].values.astype(np.float64)
+        # 1. Bandpass 60-230 Hz (strips DC drift, movement, and 50 Hz fundamental)
+        x_f = signal.sosfiltfilt(sos_bp, raw - np.mean(raw))
+
+        # 2. Notch 50 Hz and harmonics (100, 150, 200 Hz) in case of strong mains harmonics
+        for f0 in (50.0, 100.0, 150.0, 200.0):
+            if f0 < lp_cut:
+                b_n, a_n = signal.iirnotch(w0=f0, Q=15.0, fs=fs)
+                x_f = signal.filtfilt(b_n, a_n, x_f)
+
+        # 3. Fast instantaneous RMS envelope (0.25s window)
+        fast_rms = np.sqrt(np.convolve(x_f ** 2, fast_kernel, mode="same"))
+
+        # 4. Subtract slow macro-trend (6.0s sliding median floor) so only sharp ~1.5s squeezes remain!
+        rms_ds = fast_rms[::ds_factor]
+        slow_floor_ds = median_filter(rms_ds, size=slow_win_ds, mode="nearest")
+        slow_floor = np.interp(
+            np.arange(len(fast_rms)),
+            np.arange(len(rms_ds)) * ds_factor,
+            slow_floor_ds
+        )
+
+        # High-frequency transient burst above local 6s background
+        micro_burst = np.maximum(fast_rms - slow_floor, 0.0)
+
+        # Normalize by the recording's quiet interior noise MAD (20% to 80% of file)
+        mid_start, mid_end = int(len(micro_burst) * 0.20), int(len(micro_burst) * 0.80)
+        ref_slice = micro_burst[mid_start:mid_end] if mid_end > mid_start + 100 else micro_burst
+        med = float(np.median(ref_slice))
+        robust_sd = max(float(np.median(np.abs(ref_slice - med))) * 1.4826, 1e-6)
+
+        ch_snr = (micro_burst - med) / robust_sd
+        combined_snr += np.maximum(ch_snr, 0.0)
+        n_chs += 1
+
+    # Geometric + arithmetic synergy: a true squeeze activates BOTH forearm channels simultaneously
     return combined_snr / max(n_chs, 1)
 
 
@@ -144,97 +185,130 @@ def detect_squeeze_anchor_and_fs(
 ) -> tuple[int, float]:
     """
     Locates the exact sample index of:
-      1. The Start Squeeze (t = 0.0s) in the first 35% of the Shimmer recording
-      2. The End Squeeze ('sync_end') in the last 30% of the Shimmer recording
-    and computes the exact empirical sampling rate `calibrated_fs` so that even a 5-10%
-    difference between nominal fs (e.g. 2048 Hz) and true hardware fs (~1954-2000 Hz)
-    is 100% eliminated across all trials.
+      1. The Start Squeeze (t = 0.0s)
+      2. The End Squeeze ('sync_end')
+    Using the macro-detrended Micro-Burst SNR envelope AND joint bookend duration matching.
     """
-    env_snr = compute_combined_squeeze_snr(shimmer_df, fs=initial_fs)
-    n_total = len(env_snr)
-    reaction_comp_samples = int(0.25 * initial_fs)
+    n_total = len(shimmer_df)
+    end_rows = events_df[events_df["event_type"] == "sync_end"]
+    expected_rel_end_s = (
+        float(end_rows.iloc[0]["rel_from_sync_onset_s"])
+        if (not end_rows.empty and "rel_from_sync_onset_s" in end_rows.columns)
+        else None
+    )
 
-    # --- 1. LOCATE START SQUEEZE (t = 0.0s) ---
+    # Auto-detect true nominal Shimmer clock family (e.g. ~512 Hz vs ~2000 Hz) if config had 2048 Hz
+    # while the Shimmer was actually set to 512 Hz (like sub-C18EE7!)
+    working_fs = float(initial_fs)
+    if expected_rel_end_s is not None and expected_rel_end_s > 30.0:
+        rough_fs = n_total / (expected_rel_end_s + 25.0)
+        for std_fs in (512.0, 1024.0, 2000.0):
+            if abs(rough_fs - std_fs) / std_fs < 0.25 and abs(working_fs - std_fs) / std_fs > 0.30:
+                print(
+                    f"  [AUTO CLOCK DETECT] File length ({n_total:,} samples for ~{expected_rel_end_s:.0f}s run) "
+                    f"matches ~{std_fs:g} Hz Shimmer mode rather than {working_fs:g} Hz."
+                )
+                working_fs = std_fs
+                break
+
+    env_snr = compute_combined_squeeze_snr(shimmer_df, fs=working_fs)
+    reaction_comp_samples = int(0.25 * working_fs)
+
+    # Helper to walk back from a squeeze peak to its rising-edge onset (20% peak height)
+    def find_rising_edge(pk_idx: int) -> int:
+        pk_val = env_snr[pk_idx]
+        thresh = max(pk_val * 0.20, 3.5)
+        lb = max(0, pk_idx - int(1.2 * working_fs))
+        pre = env_snr[lb:pk_idx]
+        below = np.where(pre <= thresh)[0]
+        rising = (lb + int(below[-1])) if len(below) > 0 else max(0, pk_idx - int(0.35 * working_fs))
+        return max(0, rising - reaction_comp_samples)
+
+    # --- 1. LOCATE CANDIDATE START & END SQUEEZE PEAKS ---
+    search_end_idx = min(int(90.0 * working_fs), int(n_total * 0.30))
+    search_end_idx = max(search_end_idx, min(n_total, int(10.0 * working_fs)))
+    early_env = env_snr[:search_end_idx]
+
+    max_early = float(np.max(early_env))
+    start_peaks, _ = signal.find_peaks(
+        early_env,
+        height=max(max_early * 0.30, 6.0),
+        distance=int(1.5 * working_fs),
+        prominence=max(max_early * 0.25, 5.0)
+    )
+    if len(start_peaks) == 0:
+        start_peaks = np.array([int(np.argmax(early_env))])
+
+    # Search final 25% of file for End Squeeze peaks
+    tail_start_idx = int(n_total * 0.75)
+    tail_env = env_snr[tail_start_idx:]
+    max_tail = float(np.max(tail_env)) if len(tail_env) > 0 else 0.0
+    end_peaks, _ = signal.find_peaks(
+        tail_env,
+        height=max(max_tail * 0.30, 5.0),
+        distance=int(1.5 * working_fs),
+        prominence=max(max_tail * 0.25, 4.0)
+    )
+    end_peaks = end_peaks + tail_start_idx if len(end_peaks) > 0 else np.array([tail_start_idx + int(np.argmax(tail_env))])
+
+    # --- 2. SELECT BEST (START, END) PAIR USING KNOWN EXPERIMENT DURATION ---
     if manual_t0_sec is not None:
         t0_anchor_idx = int(round(manual_t0_sec * initial_fs))
-        print(f"  [MANUAL START OVERRIDE] Using t=0 at {manual_t0_sec:.2f}s (Sample Index = {t0_anchor_idx:,})")
-    else:
-        search_end_idx = min(int(120.0 * initial_fs), int(n_total * 0.35))
-        search_end_idx = max(search_end_idx, min(n_total, int(10.0 * initial_fs)))
-        early_env = env_snr[:search_end_idx]
+        print(f"  [MANUAL START OVERRIDE] t=0 set to {manual_t0_sec:.2f}s (idx {t0_anchor_idx:,})")
+    elif expected_rel_end_s is not None and len(start_peaks) >= 1 and len(end_peaks) >= 1:
+        # Score every candidate (sp, ep) pair by peak strength AND how close (ep - sp)/expected_rel_end_s
+        # is to a physical Shimmer hardware rate (512 Hz, 1024 Hz, or 1940-2048 Hz)
+        best_score = -1e18
+        best_sp, best_ep = int(start_peaks[0]), int(end_peaks[-1])
 
-        max_early = float(np.max(early_env))
-        thresh_peak = max(max_early * 0.35, 6.0)
-        peaks, _ = signal.find_peaks(early_env, height=thresh_peak, distance=int(1.0 * initial_fs))
-
-        first_peak_idx = int(peaks[0]) if len(peaks) > 0 else int(np.argmax(early_env))
-
-        peak_height = env_snr[first_peak_idx]
-        onset_threshold = max(peak_height * 0.20, 3.0)
-        lookback_start = max(0, first_peak_idx - int(1.2 * initial_fs))
-        pre_segment = env_snr[lookback_start:first_peak_idx]
-        below_indices = np.where(pre_segment <= onset_threshold)[0]
-
-        if len(below_indices) > 0:
-            start_squeeze_idx = lookback_start + int(below_indices[-1])
-        else:
-            start_squeeze_idx = max(0, first_peak_idx - int(0.35 * initial_fs))
-
-        t0_anchor_idx = max(0, start_squeeze_idx - reaction_comp_samples)
-        print(
-            f"  [START SQUEEZE DETECTED] Rising edge at idx {start_squeeze_idx:,} "
-            f"({start_squeeze_idx / initial_fs:.2f}s @ nominal fs) -> Screen t=0 anchor = idx {t0_anchor_idx:,}"
-        )
-
-    # --- 2. LOCATE END SQUEEZE ('sync_end') & RECALIBRATE SAMPLING RATE ---
-    calibrated_fs = float(initial_fs)
-    end_rows = events_df[events_df["event_type"] == "sync_end"]
-
-    if not end_rows.empty and "rel_from_sync_onset_s" in end_rows.columns:
-        expected_rel_end_s = float(end_rows.iloc[0]["rel_from_sync_onset_s"])
-
-        if manual_tend_sec is not None:
-            end_anchor_idx = int(round(manual_tend_sec * initial_fs))
-            calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
-            print(
-                f"  [MANUAL END OVERRIDE] End Squeeze at {manual_tend_sec:.2f}s (idx {end_anchor_idx:,}) "
-                f"-> Calibrated Shimmer fs = {calibrated_fs:.3f} Hz"
-            )
-            return t0_anchor_idx, calibrated_fs
-
-        # Search the final 30% of the recording (and allow +/- 15% sampling rate tolerance around expected_end_idx)
-        expected_end_idx = t0_anchor_idx + int(round(expected_rel_end_s * initial_fs))
-        tol_samples = max(int(45.0 * initial_fs), int(0.15 * expected_rel_end_s * initial_fs))
-
-        w_start = max(int(n_total * 0.70), expected_end_idx - tol_samples)
-        w_start = min(w_start, max(t0_anchor_idx + int(15.0 * initial_fs), n_total - int(60.0 * initial_fs)))
-        w_end = n_total
-
-        if w_end > w_start + int(1.0 * initial_fs):
-            end_env = env_snr[w_start:w_end]
-            max_end = float(np.max(end_env))
-
-            if max_end > 5.0:
-                # Find the prominent calibration squeeze peak in the tail of the file
-                end_peaks, _ = signal.find_peaks(end_env, height=max(max_end * 0.45, 5.0), distance=int(1.0 * initial_fs))
-                end_peak_local = int(end_peaks[-1]) if len(end_peaks) > 0 else int(np.argmax(end_env))
-                end_peak_idx = w_start + end_peak_local
-
-                ep_height = env_snr[end_peak_idx]
-                eb_lookback = max(w_start, end_peak_idx - int(1.2 * initial_fs))
-                eb_below = np.where(env_snr[eb_lookback:end_peak_idx] <= max(ep_height * 0.20, 3.0))[0]
-                end_rising_idx = (eb_lookback + int(eb_below[-1])) if len(eb_below) > 0 else end_peak_idx
-                end_anchor_idx = max(w_start, end_rising_idx - reaction_comp_samples)
-
-                calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
-                print(
-                    f"  [BOOKEND DRIFT CALIBRATED] End Squeeze detected at idx {end_rising_idx:,} "
-                    f"({end_rising_idx / initial_fs:.2f}s on nominal axis | PsychoPy Δt = {expected_rel_end_s:.2f}s)\n"
-                    f"  -> True Empirical Shimmer Sampling Rate = {calibrated_fs:.3f} Hz "
-                    f"(Nominal was {initial_fs:.1f} Hz)"
+        for sp in start_peaks:
+            for ep in end_peaks:
+                if ep <= sp + int(20.0 * working_fs):
+                    continue
+                cand_fs = (ep - sp) / expected_rel_end_s
+                # Distance to nearest standard Shimmer rate (512, 1024, or 1955 Hz)
+                rate_err = min(
+                    abs(cand_fs - 512.0) / 512.0,
+                    abs(cand_fs - 1024.0) / 1024.0,
+                    abs(cand_fs - 1955.0) / 1955.0,
+                    abs(cand_fs - working_fs) / working_fs
                 )
-            else:
-                print("  [WARNING] Could not find a clear End Squeeze peak (SNR > 5) in the final 30% of the file.")
+                norm_amp = (env_snr[sp] / (max_early + 1e-9)) + (env_snr[ep] / (max_tail + 1e-9))
+                # Penalize implausible sampling rate deviations (>5% away from hardware clock)
+                score = norm_amp - (15.0 * rate_err)
+                if score > best_score:
+                    best_score = score
+                    best_sp, best_ep = int(sp), int(ep)
+
+        t0_anchor_idx = find_rising_edge(best_sp)
+        end_anchor_idx = find_rising_edge(best_ep)
+        calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
+
+        print(
+            f"  [START SQUEEZE DETECTED] Peak at idx {best_sp:,} -> Rising-edge t=0 anchor = idx {t0_anchor_idx:,} "
+            f"({t0_anchor_idx / calibrated_fs:.2f}s)"
+        )
+        print(
+            f"  [BOOKEND DRIFT CALIBRATED] End Squeeze at idx {best_ep:,} ({end_anchor_idx / calibrated_fs:.2f}s | "
+            f"PsychoPy Δt = {expected_rel_end_s:.2f}s) -> True Shimmer fs = {calibrated_fs:.2f} Hz"
+        )
+        return t0_anchor_idx, calibrated_fs
+    else:
+        best_sp = int(start_peaks[np.argmax(env_snr[start_peaks])])
+        t0_anchor_idx = find_rising_edge(best_sp)
+        print(f"  [START SQUEEZE DETECTED] Anchor idx = {t0_anchor_idx:,} ({t0_anchor_idx / working_fs:.2f}s)")
+
+    # Manual End Override fallback
+    calibrated_fs = working_fs
+    if manual_tend_sec is not None and expected_rel_end_s is not None:
+        end_anchor_idx = int(round(manual_tend_sec * initial_fs))
+        calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
+        print(f"  [MANUAL END OVERRIDE] True Shimmer fs = {calibrated_fs:.2f} Hz")
+    elif expected_rel_end_s is not None and len(end_peaks) > 0:
+        best_ep = int(end_peaks[np.argmax(env_snr[end_peaks])])
+        end_anchor_idx = find_rising_edge(best_ep)
+        calibrated_fs = (end_anchor_idx - t0_anchor_idx) / expected_rel_end_s
+        print(f"  [BOOKEND DRIFT CALIBRATED] True Shimmer fs = {calibrated_fs:.2f} Hz")
 
     return t0_anchor_idx, calibrated_fs
 
