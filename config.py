@@ -59,7 +59,7 @@ TRIGGER_CODES = {
 }
 
 # --- DUAL-CHANNEL SHIMMER EMG MAPPING ---
-DEFAULT_SAMPLING_RATE = 2048.0  # Hz (Fallback if Shimmer timestamp is -1)
+DEFAULT_SAMPLING_RATE = 512.0  # Hz (Fallback if Shimmer timestamp is -1)
 
 EMG_CHANNEL_MAP = {
     "ch1": {
